@@ -61,6 +61,8 @@ pub const PharCacheEntry = struct {
 pub const OutputBufferLevel = struct {
     start: usize,
     callback: ?Value = null,
+    started: bool = false,
+    disabled: bool = false,
 };
 
 pub const ErrorHandlerEntry = struct { handler: Value, mask: i64 };
@@ -120,6 +122,10 @@ pub const NativeContext = struct {
 
         switch (arg_sources[arg_index]) {
             .simple => |var_name| {
+                if (VM.isSuperglobal(var_name)) {
+                    vm.putRequestVar(var_name, value) catch {};
+                    return;
+                }
                 // the caller's variable is a durable holder: a named local and
                 // its vars entry share one reference, so retain once and drop
                 // the single reference the slot held before
@@ -341,6 +347,7 @@ pub const ClassDef = struct {
     param_attributes: std.StringHashMapUnmanaged([]const AttributeDef) = .{},
     constant_names: std.StringHashMapUnmanaged(void) = .{},
     constant_order: std.ArrayListUnmanaged([]const u8) = .{},
+    constant_docs: std.StringHashMapUnmanaged([]const u8) = .{},
     const_visibility: std.StringHashMapUnmanaged(Visibility) = .{},
     const_final: std.StringHashMapUnmanaged(void) = .{},
     constant_attributes: std.StringHashMapUnmanaged([]const AttributeDef) = .{},
@@ -436,6 +443,7 @@ pub const ClassDef = struct {
         var ca_iter = self.constant_attributes.valueIterator();
         while (ca_iter.next()) |attrs| freeAttributeDefs(allocator, attrs.*);
         self.constant_attributes.deinit(allocator);
+        self.constant_docs.deinit(allocator);
         if (self.slot_layout) |layout| {
             allocator.free(layout.names);
             allocator.free(layout.defaults);
@@ -446,7 +454,7 @@ pub const ClassDef = struct {
     }
 };
 
-const TraitStaticProp = struct { name: []const u8, value: Value };
+const TraitStaticProp = struct { name: []const u8, value: Value, doc_comment: []const u8 = "" };
 
 pub const InterfaceDef = struct {
     name: []const u8,
@@ -930,6 +938,27 @@ pub const VM = struct {
         return count;
     }
 
+    const superglobal_names = [_][]const u8{ "$_SERVER", "$_GET", "$_POST", "$_FILES", "$_COOKIE", "$_SESSION", "$_ENV", "$_REQUEST" };
+
+    fn isSuperglobal(name: []const u8) bool {
+        for (superglobal_names) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+        return false;
+    }
+
+    fn superglobalCell(self: *VM, name: []const u8) RuntimeError!*Value {
+        if (self.globals_cells.get(name)) |cell| return cell;
+        const cell = try self.newRefCell();
+        try self.bindRefSlot(&self.globals_cells, name, cell);
+        try self.request_vars.put(self.allocator, name, .null);
+        return cell;
+    }
+
+    fn unsetSuperglobal(self: *VM, name: []const u8) void {
+        if (self.globals_array) |ga| ga.remove(.{ .string = Value.String.borrowed(name[1..]) });
+        if (self.request_vars.fetchRemove(name)) |old| self.releaseValue(old.value);
+        self.unbindRefSlot(&self.globals_cells, name);
+    }
+
     fn bindRefSlot(self: *VM, map: *std.StringHashMapUnmanaged(*Value), name: []const u8, cell: *Value) !void {
         const old = try map.fetchPut(self.allocator, name, cell);
         self.bindCell(cell);
@@ -1002,6 +1031,13 @@ pub const VM = struct {
     // slot bound by `$r = &$x` reads through the cell and holds nothing)
     fn referenceAliasCount(self: *VM, cell: *Value) u32 {
         var aliases: u32 = 1;
+        if (cell.* == .array) for (superglobal_names) |name| {
+            if (self.globals_cells.get(name) == cell) {
+                if (self.request_vars.get(name)) |v| {
+                    if (v == .array and v.array == cell.array) aliases += 1;
+                }
+            }
+        };
         if (self.ref_index) |ri| if (ri.fwd.get(cell)) |list| {
             aliases += @intCast(list.items.len);
         };
@@ -1591,9 +1627,9 @@ pub const VM = struct {
         try c.put(a, "SIG_ERR", .{ .int = -1 });
         try c.put(a, "WNOHANG", .{ .int = 1 });
         try c.put(a, "WUNTRACED", .{ .int = 2 });
-        try c.put(a, "SIG_BLOCK", .{ .int = 0 });
-        try c.put(a, "SIG_UNBLOCK", .{ .int = 1 });
-        try c.put(a, "SIG_SETMASK", .{ .int = 2 });
+        try c.put(a, "SIG_BLOCK", .{ .int = posix.SIG.BLOCK });
+        try c.put(a, "SIG_UNBLOCK", .{ .int = posix.SIG.UNBLOCK });
+        try c.put(a, "SIG_SETMASK", .{ .int = posix.SIG.SETMASK });
         try c.put(a, "FTP_ASCII", .{ .int = 1 });
         try c.put(a, "FTP_TEXT", .{ .int = 1 });
         try c.put(a, "FTP_BINARY", .{ .int = 2 });
@@ -2682,6 +2718,7 @@ pub const VM = struct {
         self.statics.clearRetainingCapacity();
         self.statics_cells.clearRetainingCapacity();
         self.globals_cells.clearRetainingCapacity();
+        self.globals_array = null;
         self.static_vars.clearRetainingCapacity();
         self.global_vars.clearRetainingCapacity();
         self.loaded_files.clearRetainingCapacity();
@@ -2742,7 +2779,7 @@ pub const VM = struct {
         var vars: std.StringHashMapUnmanaged(Value) = .{};
         var it = self.request_vars.iterator();
         while (it.next()) |entry| {
-            try vars.put(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            if (!isSuperglobal(entry.key_ptr.*)) try vars.put(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
         }
         if (!vars.contains("$GLOBALS")) {
             const globals_arr = try self.allocator.create(PhpArray);
@@ -2781,6 +2818,8 @@ pub const VM = struct {
         self.script_strict_types = result.strict_types;
         self.frames[0] = .{ .chunk = &result.chunk, .ip = 0, .vars = vars, .locals = locals, .slot_names = result.slot_names };
         self.frame_count = 1;
+        // Slots and vars mirror one owning binding.
+        self.retainFrameObjects(0);
         self.obj_id_base = self.objects.items.len;
         // reset the per-allocation id counter so user-visible '#N' starts at 1
         // matching PHP. internal stdlib-init objects keep the ids they already
@@ -3059,6 +3098,22 @@ pub const VM = struct {
         };
     }
 
+    // A constructor is a nested execution boundary: its caller's handlers
+    // must not resume PHP while the new opcode still owns cleanup state.
+    fn runConstructor(self: *VM, base_frame: usize, fast: bool) RuntimeError!void {
+        const saved_handlers = self.handler_count;
+        const saved_floor = self.handler_floor;
+        self.handler_floor = saved_handlers;
+        defer {
+            self.handler_count = saved_handlers;
+            self.handler_floor = saved_floor;
+        }
+        if (fast) try self.fastLoop();
+        // fastLoop may bail in a descendant, not just the constructor frame.
+        if (self.frame_count > base_frame) try self.runUntilFrame(base_frame);
+        _ = self.pop(); // only a normally returned constructor has a result
+    }
+
     pub fn run(self: *VM) RuntimeError!void {
         self.installHooks();
         return self.runLoop(0);
@@ -3095,6 +3150,10 @@ pub const VM = struct {
                 .get_var => {
                     const idx = self.readU16();
                     const name = self.currentChunk().constants.items[idx].string.bytes();
+                    if (isSuperglobal(name)) {
+                        self.push(if (self.globals_cells.get(name)) |cell| cell.* else .null);
+                        continue;
+                    }
                     // $GLOBALS is a true superglobal: always resolve to the
                     // single shared array on the VM, regardless of frame scope
                     if (std.mem.eql(u8, name, "$GLOBALS")) {
@@ -3164,6 +3223,13 @@ pub const VM = struct {
                     const idx = self.readU16();
                     const name = self.currentChunk().constants.items[idx].string.bytes();
                     const val = try self.copyValue(self.peek());
+                    if (isSuperglobal(name)) {
+                        const cell = try self.superglobalCell(name);
+                        self.setCell(cell, val);
+                        try self.propagateCellWrite(cell, val);
+                        self.releaseValue(val);
+                        continue;
+                    }
                     if (self.currentFrame().ref_slots.get(name)) |cell| {
                         self.setCell(cell, val);
                         try self.propagateCellWrite(cell, val);
@@ -3192,6 +3258,10 @@ pub const VM = struct {
                     } else {
                         var buf: [256]u8 = undefined;
                         const dollar_name = varVarName(raw_name, &buf);
+                        if (isSuperglobal(dollar_name) and self.frameInGlobalScope(self.currentFrame())) {
+                            self.push(if (self.globals_cells.get(dollar_name)) |cell| cell.* else .null);
+                            continue;
+                        }
                         if (self.currentFrame().ref_slots.get(dollar_name)) |cell| {
                             self.push(cell.*);
                         } else {
@@ -3212,8 +3282,8 @@ pub const VM = struct {
                             if (!found) {
                                 if (self.currentFrame().vars.get(dollar_name)) |val| {
                                     self.push(val);
-                                } else if (dollar_name.len > 2 and dollar_name[0] == '$' and dollar_name[1] == '_') {
-                                    self.push(self.request_vars.get(dollar_name) orelse .null);
+                                } else if (isSuperglobal(dollar_name) and self.frameInGlobalScope(self.currentFrame())) {
+                                    self.push(if (self.globals_cells.get(dollar_name)) |cell| cell.* else .null);
                                 } else {
                                     self.push(.null);
                                 }
@@ -3228,6 +3298,13 @@ pub const VM = struct {
                     if (raw_name.len > 0) {
                         var buf: [256]u8 = undefined;
                         const dollar_name = varVarName(raw_name, &buf);
+                        if (isSuperglobal(dollar_name) and self.frameInGlobalScope(self.currentFrame())) {
+                            const stable = try self.allocator.dupe(u8, dollar_name);
+                            try self.strings.append(self.allocator, stable);
+                            try self.putRequestVar(stable, val);
+                            self.releaseValue(val);
+                            continue;
+                        }
                         if (self.currentFrame().ref_slots.get(dollar_name)) |cell| {
                             self.setCell(cell, val);
                             try self.propagateCellWrite(cell, val);
@@ -3762,7 +3839,7 @@ pub const VM = struct {
                                 }
                             }
                         }
-                        const native_needs_refs = self.native_fns.contains(name) and (std.mem.eql(u8, name, "preg_match") or std.mem.eql(u8, name, "preg_match_all"));
+                        const native_needs_refs = self.native_fns.contains(name) and (std.mem.eql(u8, name, "preg_match") or std.mem.eql(u8, name, "preg_match_all") or std.mem.eql(u8, name, "pcntl_sigprocmask"));
                         if (native_needs_refs or function_needs_refs) {
                             var ref_args: [256]Value = undefined;
                             if (arr.entries.items.len > ref_args.len) return error.RuntimeError;
@@ -3817,7 +3894,7 @@ pub const VM = struct {
                                 }
                             }
                         }
-                        const native_needs_refs = self.native_fns.contains(name_val.string.bytes()) and (std.mem.eql(u8, name_val.string.bytes(), "preg_match") or std.mem.eql(u8, name_val.string.bytes(), "preg_match_all"));
+                        const native_needs_refs = self.native_fns.contains(name_val.string.bytes()) and (std.mem.eql(u8, name_val.string.bytes(), "preg_match") or std.mem.eql(u8, name_val.string.bytes(), "preg_match_all") or std.mem.eql(u8, name_val.string.bytes(), "pcntl_sigprocmask"));
                         if (native_needs_refs or function_needs_refs) {
                             var ref_args: [256]Value = undefined;
                             if (arr.entries.items.len > ref_args.len) return error.RuntimeError;
@@ -3908,11 +3985,17 @@ pub const VM = struct {
                             if (try self.throwBuiltinException("TypeError", "Array callback must have exactly two elements")) continue;
                             return error.RuntimeError;
                         }
-                    } else if (name_val == .object and self.hasMethod(name_val.object.class_name, "__invoke")) {
-                        var args_buf: [32]Value = undefined;
+                    } else if (name_val == .object and (std.mem.eql(u8, name_val.object.class_name, "Closure") or self.hasMethod(name_val.object.class_name, "__invoke"))) {
+                        retainValue(name_val);
+                        defer self.releaseValue(name_val);
                         const ac = arr.entries.items.len;
+                        const args_buf = try self.allocator.alloc(Value, ac);
+                        defer self.allocator.free(args_buf);
                         for (0..ac) |i| args_buf[i] = arr.entries.items[i].value;
-                        const result = try self.callMethod(name_val.object, "__invoke", args_buf[0..ac]);
+                        const result = if (std.mem.eql(u8, name_val.object.class_name, "Closure"))
+                            try self.callValueCallable(name_val.object.get("__callable"), args_buf[0..ac])
+                        else
+                            try self.callMethod(name_val.object, "__invoke", args_buf[0..ac]);
                         self.pushCallResult(result);
                     } else {
                         var buf2: [256]u8 = undefined;
@@ -4738,9 +4821,35 @@ pub const VM = struct {
 
                 .ensure_array_var => {
                     const idx = self.readU16();
+                    const separate_only = self.readByte() != 0;
                     const name = self.currentChunk().constants.items[idx].string.bytes();
+                    if (isSuperglobal(name)) {
+                        var cell = self.globals_cells.get(name);
+                        if (separate_only) {
+                            if (cell) |c| if (c.* == .array) {
+                                _ = try self.separateReferencedArray(self.currentFrame(), name, c, c.array);
+                            };
+                            continue;
+                        }
+                        if (cell == null) cell = try self.superglobalCell(name);
+                        const c = cell.?;
+                        if (c.* == .array) {
+                            _ = try self.separateReferencedArray(self.currentFrame(), name, c, c.array);
+                        } else if (c.* == .null or (c.* == .bool and !c.bool)) {
+                            const arr = try self.allocator.create(PhpArray);
+                            arr.* = .{};
+                            try self.arrays.append(self.allocator, arr);
+                            self.setCell(c, .{ .array = arr });
+                        } else if (c.* != .string and c.* != .object) {
+                            if (try self.throwBuiltinException("Error", "Cannot use a scalar value as an array")) continue;
+                            return error.RuntimeError;
+                        }
+                        self.push(c.*);
+                        continue;
+                    }
                     // $GLOBALS resolves to the VM-wide superglobal array
                     if (std.mem.eql(u8, name, "$GLOBALS")) {
+                        if (separate_only) continue;
                         if (self.globals_array) |ga| {
                             self.push(.{ .array = ga });
                             continue;
@@ -5328,36 +5437,17 @@ pub const VM = struct {
                     const dst_name = self.currentChunk().constants.items[dst_idx].string.bytes();
                     const src_name = self.currentChunk().constants.items[src_idx].string.bytes();
                     const frame = self.currentFrame();
-                    var cell: *Value = undefined;
-                    if (frame.ref_slots.get(src_name)) |existing| {
-                        cell = existing;
+                    const cell = try self.getOrCreateVarCell(frame, src_name);
+                    if (isSuperglobal(dst_name)) {
+                        try self.bindRefSlot(&self.globals_cells, dst_name, cell);
+                        try self.putRequestVar(dst_name, cell.*);
                     } else {
-                        cell = try self.newRefCell();
-                        // seed without copyValue so cell shares any array pointer
-                        var seed: Value = .null;
-                        const sn = if (frame.func) |fn_| fn_.slot_names else self.global_slot_names;
-                        var found_slot = false;
-                        for (sn, 0..) |s, si| {
-                            if (std.mem.eql(u8, s, src_name) and si < frame.locals.len) {
-                                seed = frame.locals[si];
-                                found_slot = true;
-                                break;
-                            }
-                        }
-                        if (!found_slot) {
-                            if (frame.vars.get(src_name)) |v| seed = v;
-                        }
-                        self.setCell(cell, seed);
-
-                        try self.bindRefSlot(&frame.ref_slots, src_name, cell);
+                        try self.bindRefSlot(&frame.ref_slots, dst_name, cell);
                     }
-                    try self.bindRefSlot(&frame.ref_slots, dst_name, cell);
                     if (frame.include_parent) |parent_idx| {
                         const parent = &self.frames[parent_idx];
-                        try self.bindRefSlot(&parent.ref_slots, src_name, cell);
-                        try self.bindRefSlot(&parent.ref_slots, dst_name, cell);
-                        try parent.vars.put(self.allocator, src_name, cell.*);
-                        try parent.vars.put(self.allocator, dst_name, cell.*);
+                        if (!isSuperglobal(src_name)) try self.bindRefSlot(&parent.ref_slots, src_name, cell);
+                        if (!isSuperglobal(dst_name)) try self.bindRefSlot(&parent.ref_slots, dst_name, cell);
                     }
                 },
 
@@ -5582,6 +5672,10 @@ pub const VM = struct {
                 .unset_var => {
                     const idx = self.readU16();
                     const name = self.currentChunk().constants.items[idx].string.bytes();
+                    if (isSuperglobal(name)) {
+                        self.unsetSuperglobal(name);
+                        continue;
+                    }
                     const uframe = self.currentFrame();
                     const u_is_ref = uframe.ref_slots.contains(name);
                     if (uframe.vars.get(name)) |existing| {
@@ -6129,7 +6223,10 @@ pub const VM = struct {
                         }
                         try self.objects.append(self.allocator, copy);
                         if (self.hasMethod(src.class_name, "__clone")) {
-                            _ = self.callMethod(copy, "__clone", &.{}) catch {};
+                            _ = self.callMethod(copy, "__clone", &.{}) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
                         }
                         self.push(.{ .object = copy });
                     } else {
@@ -6533,6 +6630,7 @@ pub const VM = struct {
                     // + constants) so this is the first read after a value was
                     // set there
                     var cell = self.globals_cells.get(name);
+                    if (isSuperglobal(name) and cell == null) cell = try self.superglobalCell(name);
                     if (cell == null) {
                         if (self.frames[0].ref_slots.get(name)) |top_cell| {
                             const owned = try self.allocator.dupe(u8, name);
@@ -6583,7 +6681,9 @@ pub const VM = struct {
                     // top-level reads of $name pick up writes done by function
                     // frames sharing the cell
                     try self.bindRefSlot(&self.currentFrame().ref_slots, name, cell.?);
-                    try self.currentFrame().vars.put(self.allocator, name, cell.?.*);
+                    // vars/locals are one owning mirror, even for a cell.
+                    retainValue(cell.?.*);
+                    try self.setVariableByName(self.currentFrame(), name, cell.?.*);
                     if (self.frame_count > 1) {
                         try self.bindRefSlot(&self.frames[0].ref_slots, name, cell.?);
                     }
@@ -6902,6 +7002,8 @@ pub const VM = struct {
                         while (ci > 0) : (ci -= 1) {
                             const cname_idx = self.readU16();
                             const cname = self.currentChunk().constants.items[cname_idx].string.bytes();
+                            const doc_idx = self.readU16();
+                            if (doc_idx != 0xffff) try def.constant_docs.put(self.allocator, cname, self.currentChunk().constants.items[doc_idx].string.bytes());
                             const cval = self.stack[self.sp - ci];
                             // copyValue: the constant value is owned by the
                             // ClassDef and must be refcounted
@@ -7008,9 +7110,12 @@ pub const VM = struct {
                     if (tc_count > 0) {
                         var tc_names: [32][]const u8 = undefined;
                         var tc_has_default: [32]u8 = undefined;
+                        var tc_docs: [32][]const u8 = undefined;
                         for (0..tc_count) |ci| {
                             tc_names[ci] = self.currentChunk().constants.items[self.readU16()].string.bytes();
                             tc_has_default[ci] = self.readByte();
+                            const doc_idx = self.readU16();
+                            tc_docs[ci] = if (doc_idx == 0xffff) "" else self.currentChunk().constants.items[doc_idx].string.bytes();
                         }
                         const tc_defaults = self.popDefaults(32, tc_has_default[0..tc_count]);
                         const tcs = try self.allocator.alloc(TraitStaticProp, tc_count);
@@ -7021,7 +7126,7 @@ pub const VM = struct {
                                 tcj += 1;
                                 break :blk v;
                             } else Value{ .null = {} };
-                            tcs[ci] = .{ .name = tc_names[ci], .value = cval };
+                            tcs[ci] = .{ .name = tc_names[ci], .value = cval, .doc_comment = tc_docs[ci] };
                         }
                         try self.trait_constants.put(self.allocator, trait_name, tcs);
                     }
@@ -7329,18 +7434,10 @@ pub const VM = struct {
                                 self.frame_count += 1;
                                 self.retainFrameObjects(self.frame_count - 1);
                                 if (self.frame_count > self.frame_high_water) self.frame_high_water = self.frame_count;
-                                self.exception_dispatched = false;
-                                try self.fastLoop();
-                                const ctor_frame = &self.frames[self.frame_count - 1];
-                                if (ctor_frame.chunk == &func.chunk) {
-                                    const ctor_base = self.frame_count - 1;
-                                    try self.runUntilFrame(ctor_base);
-                                    if (self.exception_dispatched) {
-                                        self.exception_dispatched = false;
-                                        continue;
-                                    }
-                                }
-                                _ = self.pop();
+                                self.runConstructor(self.frame_count - 1, true) catch |err| {
+                                    if (self.dispatchPendingException(base_frame)) continue;
+                                    return err;
+                                };
                             } else {
                                 var new_vars = self.acquireFrameVars();
                                 try new_vars.put(self.allocator, "$this", .{ .object = obj });
@@ -7377,14 +7474,10 @@ pub const VM = struct {
                                 self.frame_count += 1;
                                 self.retainFrameObjects(self.frame_count - 1);
                                 if (self.frame_count > self.frame_high_water) self.frame_high_water = self.frame_count;
-                                self.exception_dispatched = false;
-                                const ctor_base = self.frame_count - 1;
-                                try self.runUntilFrame(ctor_base);
-                                if (self.exception_dispatched) {
-                                    self.exception_dispatched = false;
-                                    continue;
-                                }
-                                _ = self.pop();
+                                self.runConstructor(self.frame_count - 1, false) catch |err| {
+                                    if (self.dispatchPendingException(base_frame)) continue;
+                                    return err;
+                                };
                             }
                         } else {
                             self.dropN(ac);
@@ -7500,14 +7593,10 @@ pub const VM = struct {
                             self.frame_count += 1;
                             self.retainFrameObjects(self.frame_count - 1);
                             if (self.frame_count > self.frame_high_water) self.frame_high_water = self.frame_count;
-                            self.exception_dispatched = false;
-                            const ctor_base = self.frame_count - 1;
-                            try self.runUntilFrame(ctor_base);
-                            if (self.exception_dispatched) {
-                                self.exception_dispatched = false;
-                                continue;
-                            }
-                            _ = self.pop();
+                            self.runConstructor(self.frame_count - 1, false) catch |err| {
+                                if (self.dispatchPendingException(base_frame)) continue;
+                                return err;
+                            };
                         } else {
                             self.dropN(ac + 1);
                         }
@@ -8272,6 +8361,13 @@ pub const VM = struct {
                                     // name so the stack trace shows it at #0
                                     if (self.pending_exception) |exc| {
                                         if (!isFrameOutNative(mc_entry.full_name)) self.prependNativeFrameToTrace(exc, mc_entry.full_name, args_buf[0..ac]) catch {};
+                                        // Cached calls must dispatch pending callback exceptions
+                                        // just like uncached native calls, but only to a handler
+                                        // owned by this execution boundary.
+                                        if (self.dispatchPendingException(base_frame)) {
+                                            self.pending_native_name = null;
+                                            continue;
+                                        }
                                         self.pending_native_name = mc_entry.full_name;
                                         self.pending_native_is_instance = true;
                                     }
@@ -10231,7 +10327,7 @@ pub const VM = struct {
         try arr.append(self.allocator, .{ .array = entry });
     }
 
-    // capture the current user call stack as an exception __trace array. one
+    // capture the current user call stack as an exception trace array. one
     // entry per active user frame (top-down), each carrying the function name
     // and the call site's line/file - so an exception thrown by a native
     // function still reports the user functions that led to it
@@ -10279,7 +10375,7 @@ pub const VM = struct {
     }
 
     // when a native (e.g. array_map, iterator_apply) calls a user callback
-    // that throws, splice the native into the exception's __trace to match
+    // that throws, splice the native into the exception's trace to match
     // PHP. PHP's getTrace() puts the throwing user callback at #0 attributed
     // as `[internal function]` (no file/line), then the native at #1 with
     // the user call-site file/line and the native's args - the native was
@@ -10290,7 +10386,7 @@ pub const VM = struct {
     fn prependNativeFrameToTrace(self: *VM, exc: Value, name: []const u8, native_args: []const Value) !void {
         if (exc != .object) return;
         const obj = exc.object;
-        const trace_v = obj.get("__trace");
+        const trace_v = obj.getForScope("trace", self.exceptionTraceScope(obj));
         if (trace_v != .array) return;
         const old_trace = trace_v.array;
         if (old_trace.entries.items.len == 0) return;
@@ -10317,13 +10413,27 @@ pub const VM = struct {
         try new_trace.append(self.allocator, .{ .array = closure_entry });
         try new_trace.append(self.allocator, .{ .array = native_entry });
         for (old_trace.entries.items[1..]) |e| try new_trace.append(self.allocator, e.value);
-        try obj.set(self.allocator, "__trace", .{ .array = new_trace });
+        try obj.setForScope(self.allocator, "trace", .{ .array = new_trace }, self.exceptionTraceScope(obj));
+    }
+
+    // Native throwable access must use the root declaring class, never a
+    // subclass's unrelated same-name property.
+    pub fn exceptionTraceScope(self: *VM, obj: *const PhpObject) []const u8 {
+        var name = obj.class_name;
+        while (true) {
+            if (std.mem.eql(u8, name, "Error")) return "Error";
+            if (std.mem.eql(u8, name, "Exception")) return "Exception";
+            const cls = self.classes.get(name) orelse break;
+            name = cls.parent orelse break;
+        }
+        return "Exception";
     }
 
     pub fn setPendingException(self: *VM, class_name: []const u8, message: []const u8) !void {
         const obj = try self.allocator.create(PhpObject);
         self.next_object_id += 1;
         obj.* = .{ .class_name = class_name, .id = self.next_object_id };
+        try self.initObjectProperties(obj, class_name);
         try obj.set(self.allocator, "message", .{ .string = Value.String.borrowed(message) });
         try obj.set(self.allocator, "code", .{ .int = 0 });
         const exc_file = if (self.frame_count > 0) self.frameFile(self.frame_count - 1) else self.file_path;
@@ -10334,7 +10444,7 @@ pub const VM = struct {
         else
             0;
         try obj.set(self.allocator, "line", .{ .int = line });
-        try obj.set(self.allocator, "__trace", .{ .array = try self.buildExceptionTrace() });
+        try obj.setForScope(self.allocator, "trace", .{ .array = try self.buildExceptionTrace() }, self.exceptionTraceScope(obj));
         try self.objects.append(self.allocator, obj);
         self.pending_exception = .{ .object = obj };
     }
@@ -10615,6 +10725,7 @@ pub const VM = struct {
         const obj = try self.allocator.create(PhpObject);
         self.next_object_id += 1;
         obj.* = .{ .class_name = class_name, .id = self.next_object_id };
+        try self.initObjectProperties(obj, class_name);
         try obj.set(self.allocator, "message", .{ .string = Value.String.borrowed(message) });
         try obj.set(self.allocator, "code", .{ .int = 0 });
         // file/line should reflect the throwing frame (often a function in a
@@ -10631,7 +10742,7 @@ pub const VM = struct {
         else
             0;
         try obj.set(self.allocator, "line", .{ .int = line });
-        try obj.set(self.allocator, "__trace", .{ .array = try self.buildExceptionTrace() });
+        try obj.setForScope(self.allocator, "trace", .{ .array = try self.buildExceptionTrace() }, self.exceptionTraceScope(obj));
         try self.objects.append(self.allocator, obj);
 
         if (self.handler_count <= self.handler_floor) {
@@ -10830,7 +10941,7 @@ pub const VM = struct {
     }
 
     // the reference cell bound to a local slot, in a function or the script frame
-    fn slotRefCell(self: *VM, frame: *CallFrame, slot: u16) ?*Value {
+    pub fn slotRefCell(self: *VM, frame: *CallFrame, slot: u16) ?*Value {
         if (frame.ref_slots.count() == 0) return null;
         const names = if (frame.func) |func| func.slot_names else self.global_slot_names;
         if (slot >= names.len or names[slot].len == 0) return null;
@@ -10855,6 +10966,7 @@ pub const VM = struct {
         const sv = Value{ .array = clone };
         self.setCell(cell, sv);
         try self.propagateCellWrite(cell, sv);
+        if (isSuperglobal(name) and self.globals_cells.get(name) == cell) return clone;
         retainValue(sv);
         const names = if (frame.func) |func| func.slot_names else self.global_slot_names;
         var slot: ?usize = null;
@@ -11022,6 +11134,10 @@ pub const VM = struct {
     fn mirrorGlobalsWrite(self: *VM, key: []const u8, val: Value) !void {
         const dollar_name = std.fmt.allocPrint(self.allocator, "${s}", .{key}) catch return;
         try self.strings.append(self.allocator, dollar_name);
+        if (isSuperglobal(dollar_name)) {
+            try self.putRequestVar(dollar_name, val);
+            return;
+        }
 
         // top frame: vars + locals (slot lookup via top_slot_names — must
         // not use global_slot_names because it's overridden inside require)
@@ -11330,6 +11446,7 @@ pub const VM = struct {
                 try def.const_visibility.put(self.allocator, sprop_names[pi], @enumFromInt(vis_byte));
             }
             if (sprop_is_const[pi] == 1) {
+                try def.constant_docs.put(self.allocator, sprop_names[pi], sprop_doc[pi]);
                 if (!def.constant_names.contains(sprop_names[pi])) {
                     try def.constant_order.append(self.allocator, sprop_names[pi]);
                 }
@@ -11679,6 +11796,8 @@ pub const VM = struct {
         for (0..case_count) |ci| {
             case_names[ci] = self.currentChunk().constants.items[self.readU16()].string.bytes();
             case_has_value[ci] = self.readByte();
+            const doc_idx = self.readU16();
+            if (doc_idx != 0xffff) try def.constant_docs.put(self.allocator, case_names[ci], self.currentChunk().constants.items[doc_idx].string.bytes());
         }
 
         var case_values = try self.allocator.alloc(Value, case_count);
@@ -11761,6 +11880,8 @@ pub const VM = struct {
         for (0..enum_const_count) |_| {
             const ec_name_idx = self.readU16();
             const ec_name = self.currentChunk().constants.items[ec_name_idx].string.bytes();
+            const doc_idx = self.readU16();
+            if (doc_idx != 0xffff) try def.constant_docs.put(self.allocator, ec_name, self.currentChunk().constants.items[doc_idx].string.bytes());
             if (!def.constant_names.contains(ec_name)) {
                 try def.constant_order.append(self.allocator, ec_name);
             }
@@ -12070,6 +12191,7 @@ pub const VM = struct {
                     // each using class gets its own refcounted copy
                     try def.static_props.put(self.allocator, c.name, try self.copyDefault(c.value));
                     try def.constant_names.put(self.allocator, c.name, {});
+                    try def.constant_docs.put(self.allocator, c.name, c.doc_comment);
                 }
             }
         }
@@ -13065,6 +13187,7 @@ pub const VM = struct {
     // (seed the cell from $var's current value, sharing any array pointer). the
     // source-of-truth for `$arr[$k] = &$var` and `$arr[] = &$var`
     fn getOrCreateVarCell(self: *VM, frame: *CallFrame, var_name: []const u8) RuntimeError!*Value {
+        if (isSuperglobal(var_name)) return self.superglobalCell(var_name);
         if (frame.ref_slots.get(var_name)) |existing| return existing;
         const cell = try self.newRefCell();
         var seed: Value = .null;
@@ -13105,6 +13228,20 @@ pub const VM = struct {
     // value and releases the previous one. mirrors (variable slots, array
     // elements, properties, captures) own their own references independently
     pub fn setCell(self: *VM, cell: *Value, val: Value) void {
+        // Native request consumers share the canonical binding too. The map
+        // remains an owning mirror, including when the value is replaced.
+        for (superglobal_names) |name| {
+            if (self.globals_cells.get(name) == cell) {
+                if (self.globals_array) |ga| {
+                    if (ga.getPtr(.{ .string = Value.String.borrowed(name[1..]) })) |entry| entry.value = val;
+                }
+                if (self.request_vars.getPtr(name)) |vp| {
+                    retainValue(val);
+                    self.releaseValue(vp.*);
+                    vp.* = val;
+                }
+            }
+        }
         retainValue(val);
         self.releaseValue(cell.*);
         cell.* = val;
@@ -13241,6 +13378,7 @@ pub const VM = struct {
     }
 
     fn resolveCallerVar(self: *VM, var_name: []const u8, is_local: bool, slot: u16) Value {
+        if (!is_local and isSuperglobal(var_name)) return if (self.globals_cells.get(var_name)) |cell| cell.* else .null;
         const frame = self.currentFrame();
         if (is_local and slot < frame.locals.len) {
             return frame.locals[slot];
@@ -13401,6 +13539,7 @@ pub const VM = struct {
                 // without this the by-ref lvalue arg is mis-delimited and loses
                 // its writeback binding
                 const eff: i32 = switch (op) {
+                    .ensure_array_var => if (pos + 3 < code.len and code[pos + 3] != 0) 0 else 1,
                     .call, .new_obj => if (pos + 3 < code.len) 1 - @as(i32, code[pos + 3]) else op.stackEffect(),
                     .method_call => if (pos + 3 < code.len) -@as(i32, code[pos + 3]) else op.stackEffect(),
                     .static_call => if (pos + 5 < code.len) 1 - @as(i32, code[pos + 5]) else op.stackEffect(),
@@ -13665,6 +13804,13 @@ pub const VM = struct {
             if (!func.ref_params[ri]) continue;
             switch (arg_sources[ri]) {
                 .simple => |caller_var| {
+                    if (isSuperglobal(caller_var)) {
+                        const cell = try self.superglobalCell(caller_var);
+                        if (cell.* == .array) _ = try self.separateReferencedArray(self.currentFrame(), caller_var, cell, cell.array);
+                        try new_vars.put(self.allocator, func.params[ri], cell.*);
+                        try self.bindRefSlot(refs, func.params[ri], cell);
+                        continue;
+                    }
                     if (self.currentFrame().ref_slots.get(caller_var)) |existing_cell| {
                         self.setCell(existing_cell, new_vars.get(func.params[ri]) orelse .null);
                         try self.bindRefSlot(refs, func.params[ri], existing_cell);
@@ -13838,10 +13984,10 @@ pub const VM = struct {
 
         for (self.autoload_callbacks.items) |callback| {
             if (callback == .string) {
-                _ = self.callByName(callback.string.bytes(), &.{.{ .string = Value.String.borrowed(class_name) }}) catch continue;
+                _ = try self.callByName(callback.string.bytes(), &.{.{ .string = Value.String.borrowed(class_name) }});
             } else {
                 var ctx = self.makeContext(null);
-                _ = ctx.invokeCallable(callback, &.{.{ .string = Value.String.borrowed(class_name) }}) catch continue;
+                _ = try ctx.invokeCallable(callback, &.{.{ .string = Value.String.borrowed(class_name) }});
             }
             if (self.classes.contains(class_name)) return;
         }
@@ -14525,7 +14671,7 @@ pub const VM = struct {
         }
     }
 
-    fn buildSlotLayout(self: *VM, def: *const ClassDef) RuntimeError!?*PhpObject.SlotLayout {
+    pub fn buildSlotLayout(self: *VM, def: *const ClassDef) RuntimeError!?*PhpObject.SlotLayout {
         // collect all properties walking parent chain (parent first). private
         // slots from each declaring class get their OWN entry (PHP keeps
         // parent's `private $foo` and child's `private $foo` separate); only
@@ -14821,7 +14967,11 @@ pub const VM = struct {
         // copy to the first in-place mutation, which separates via cowSeparate
         // at the lvalue site. self is unused on the share path but kept so this
         // stays a *VM method (called as self.copyValue everywhere)
-        _ = self;
+        if (val == .array and val.array.weak) {
+            const copy = try self.shallowCloneCow(val.array);
+            arrayRetain(copy);
+            return .{ .array = copy };
+        }
         if (val == .string) {
             val.string.retain();
             return val;
@@ -15622,7 +15772,7 @@ pub const VM = struct {
     // enforce a typed property's declared type on write. mirrors checkParamTypes:
     // non-strict weak-coerces a compatible scalar, strict rejects a mismatch.
     // returns true if a TypeError was thrown+dispatched (caller should continue)
-    noinline fn checkPropertyType(self: *VM, val: *Value, type_str: []const u8, class_name: []const u8, prop_name: []const u8) RuntimeError!bool {
+    pub noinline fn checkPropertyType(self: *VM, val: *Value, type_str: []const u8, class_name: []const u8, prop_name: []const u8) RuntimeError!bool {
         if (type_str.len == 0) return false;
         // fast path: the value's tag already exactly matches a simple scalar
         // declared type - no coercion, no checkTypeMatch parse needed
@@ -16046,6 +16196,10 @@ pub const VM = struct {
     }
 
     pub fn releaseCallbackRegistries(self: *VM) void {
+        for (self.ob_stack.items) |*level| {
+            if (level.callback) |cb| self.releaseValue(cb);
+            level.callback = null;
+        }
         for (self.shutdown_callbacks.items) |cb| self.releaseValue(cb);
         self.shutdown_callbacks.clearRetainingCapacity();
         for (self.autoload_callbacks.items) |cb| self.releaseValue(cb);
@@ -17644,6 +17798,14 @@ pub const VM = struct {
     }
 
     pub fn arrayRemoveOwned(self: *VM, array: *PhpArray, key: PhpArray.Key) void {
+        if (array == self.globals_array and key == .string) {
+            var buf: [256]u8 = undefined;
+            const name = varVarName(key.string.bytes(), &buf);
+            if (isSuperglobal(name)) {
+                self.unsetSuperglobal(name);
+                return;
+            }
+        }
         if (!array.contains(key)) return;
         const old = array.get(key);
         if (array.getPtr(key)) |entry| {
@@ -17779,12 +17941,25 @@ pub const VM = struct {
         retainValue(value);
         const old = try self.request_vars.fetchPut(self.allocator, name, value);
         if (old) |kv| self.releaseValue(kv.value);
+        if (isSuperglobal(name)) {
+            const cell = self.globals_cells.get(name) orelse blk: {
+                const fresh = try self.newRefCell();
+                try self.bindRefSlot(&self.globals_cells, name, fresh);
+                break :blk fresh;
+            };
+            self.setCell(cell, value);
+        }
     }
 
     // store into the global scope's variable table (a durable holder): the
     // vars entry and its slot mirror share one reference. `Owned` takes a
     // reference the caller already holds
     pub fn putGlobalVarOwned(self: *VM, name: []const u8, value: Value) !void {
+        if (isSuperglobal(name)) {
+            defer self.releaseValue(value);
+            try self.putRequestVar(name, value);
+            return;
+        }
         if (self.frame_count == 0) {
             self.releaseValue(value);
             return;

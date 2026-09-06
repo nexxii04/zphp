@@ -1318,6 +1318,7 @@ fn native_get_parent_class(ctx: *NativeContext, args: []const Value) RuntimeErro
     else
         return Value{ .bool = false };
     const class_name = if (raw.len > 0 and raw[0] == '\\') raw[1..] else raw;
+    if (ctx.vm.traits.contains(class_name) or ctx.vm.interfaces.contains(class_name)) return .{ .bool = false };
     const cls = ctx.vm.classes.get(class_name) orelse {
         try ctx.vm.setPendingException("TypeError", "get_parent_class(): Argument #1 ($object_or_class) must be an object or a valid class name");
         return error.RuntimeError;
@@ -2503,16 +2504,26 @@ fn native_class_implements(ctx: *NativeContext, args: []const Value) RuntimeErro
         return Value{ .bool = false };
     const class_name = if (raw.len > 0 and raw[0] == '\\') raw[1..] else raw;
 
-    const cls = ctx.vm.classes.get(class_name) orelse return Value{ .bool = false };
+    const cls = ctx.vm.classes.get(class_name);
+    const interface = ctx.vm.interfaces.get(class_name);
+    if (cls == null and interface == null and !ctx.vm.traits.contains(class_name)) return .{ .bool = false };
 
     var result = try ctx.createArray();
     var queue = std.ArrayListUnmanaged([]const u8){};
     defer queue.deinit(ctx.allocator);
+    if (interface) |def| {
+        for (def.parents.items) |parent| try queue.append(ctx.allocator, parent);
+        if (def.parents.items.len == 0) {
+            if (def.parent) |parent| try queue.append(ctx.allocator, parent);
+        }
+    }
     // PHP enumerates direct interfaces in declaration order, but interfaces
     // reached via parent traversal in REVERSE declaration order. mimic both
-    for (cls.interfaces.items) |iface| try queue.append(ctx.allocator, iface);
+    if (cls) |def| {
+        for (def.interfaces.items) |iface| try queue.append(ctx.allocator, iface);
+    }
 
-    var parent = cls.parent;
+    var parent = if (cls) |def| def.parent else null;
     while (parent) |p| {
         const pcls = ctx.vm.classes.get(p) orelse break;
         var pi = pcls.interfaces.items.len;
@@ -2528,11 +2539,20 @@ fn native_class_implements(ctx: *NativeContext, args: []const Value) RuntimeErro
         const iface = queue.items[i];
         if (result.get(.{ .string = Value.String.borrowed(iface) }) != .null) continue;
         try result.set(ctx.allocator, .{ .string = Value.String.borrowed(iface) }, .{ .string = Value.String.borrowed(iface) });
-        if (ctx.vm.classes.get(iface)) |idef| {
-            for (idef.interfaces.items) |sub| try queue.append(ctx.allocator, sub);
+        if (!ctx.vm.interfaces.contains(iface)) {
+            if (ctx.vm.classes.get(iface)) |idef| {
+                for (idef.interfaces.items) |sub| try queue.append(ctx.allocator, sub);
+            }
         }
         if (ctx.vm.interfaces.get(iface)) |idef| {
-            if (idef.parent) |p| try queue.append(ctx.allocator, p);
+            if (idef.parents.items.len == 0) {
+                if (idef.parent) |p| try queue.append(ctx.allocator, p);
+            }
+            var pi = idef.parents.items.len;
+            while (pi > 0) {
+                pi -= 1;
+                try queue.append(ctx.allocator, idef.parents.items[pi]);
+            }
         }
     }
 
@@ -2577,14 +2597,17 @@ fn native_class_uses(ctx: *NativeContext, args: []const Value) RuntimeError!Valu
         return Value{ .bool = false };
     const class_name = if (raw.len > 0 and raw[0] == '\\') raw[1..] else raw;
 
-    const cls = ctx.vm.classes.get(class_name) orelse {
-        try ctx.vm.tryAutoload(class_name);
-        if (ctx.vm.classes.get(class_name) == null) return Value{ .bool = false };
-        return native_class_uses(ctx, args);
-    };
+    if (!ctx.vm.classes.contains(class_name) and !ctx.vm.traits.contains(class_name) and !ctx.vm.interfaces.contains(class_name)) {
+        if (args.len < 2 or args[1].isTruthy()) try ctx.vm.tryAutoload(class_name);
+        if (!ctx.vm.classes.contains(class_name) and !ctx.vm.traits.contains(class_name) and !ctx.vm.interfaces.contains(class_name)) return .{ .bool = false };
+    }
+    const used_traits = if (ctx.vm.classes.get(class_name)) |cls|
+        cls.used_traits.items
+    else
+        ctx.vm.trait_uses.get(class_name) orelse &.{};
 
     var result = try ctx.createArray();
-    for (cls.used_traits.items) |trait| {
+    for (used_traits) |trait| {
         try result.set(ctx.allocator, .{ .string = Value.String.borrowed(trait) }, .{ .string = Value.String.borrowed(trait) });
     }
     return .{ .array = result };
