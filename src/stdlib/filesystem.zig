@@ -416,6 +416,20 @@ const CurlWriteData = struct {
     buffer: std.ArrayListUnmanaged(u8),
 };
 
+const CurlHeaderData = struct {
+    ctx: *NativeContext,
+    headers: *PhpArray,
+    in_1xx: bool = false,
+    oom: bool = false,
+};
+
+fn parseHttpStatus(line: []const u8) ?u16 {
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    _ = it.next() orelse return null;
+    const code_str = it.next() orelse return null;
+    return std.fmt.parseInt(u16, code_str, 10) catch null;
+}
+
 fn curlWriteCallback(data: [*]u8, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
     const total = size * nmemb;
     const wd: *CurlWriteData = @ptrCast(@alignCast(userdata));
@@ -423,7 +437,35 @@ fn curlWriteCallback(data: [*]u8, size: usize, nmemb: usize, userdata: *anyopaqu
     return total;
 }
 
+fn curlHeaderCallback(data: [*]u8, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
+    const total = std.math.mul(usize, size, nmemb) catch return 0;
+    const hd: *CurlHeaderData = @ptrCast(@alignCast(userdata));
+    const raw = std.mem.trimEnd(u8, data[0..total], "\r\n");
+    const status = std.mem.startsWith(u8, raw, "HTTP/");
+    if (status) {
+        const code = parseHttpStatus(raw) orelse return total;
+        hd.in_1xx = code >= 100 and code < 200 and code != 101;
+    }
+    if (hd.in_1xx) return total;
+    const line = if (status) raw else std.mem.trimEnd(u8, raw, " \t");
+    if (line.len == 0) return total;
+    const owned = Value.String.create(hd.ctx.allocator, line) catch {
+        hd.oom = true;
+        return 0;
+    };
+    defer owned.release();
+    hd.headers.append(hd.ctx.allocator, .{ .string = owned }) catch {
+        hd.oom = true;
+        return 0;
+    };
+    return total;
+}
+
 fn fetchUrl(ctx: *NativeContext, url: []const u8) RuntimeError!Value {
+    if (ctx.vm.last_http_response_headers) |previous| ctx.vm.arrayRelease(previous);
+    ctx.vm.last_http_response_headers = null;
+
+    // Note: process-local curl_global_init is safe under zphp serve's fork-based worker model.
     if (!curl_global_init_done) {
         _ = c_curl.curl_global_init(c_curl.CURL_GLOBAL_DEFAULT);
         curl_global_init_done = true;
@@ -439,7 +481,7 @@ fn fetchUrl(ctx: *NativeContext, url: []const u8) RuntimeError!Value {
 
     _ = c_curl.curl_easy_setopt(handle, c_curl.CURLOPT_URL, &url_buf);
     _ = c_curl.curl_easy_setopt(handle, c_curl.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
-    _ = c_curl.curl_easy_setopt(handle, c_curl.CURLOPT_MAXREDIRS, @as(c_long, 10));
+    _ = c_curl.curl_easy_setopt(handle, c_curl.CURLOPT_MAXREDIRS, @as(c_long, 20));
 
     var wd = CurlWriteData{
         .allocator = ctx.allocator,
@@ -447,10 +489,24 @@ fn fetchUrl(ctx: *NativeContext, url: []const u8) RuntimeError!Value {
     };
     defer wd.buffer.deinit(wd.allocator);
 
+    const headers_arr = ctx.createArray() catch return .{ .bool = false };
+    @import("../runtime/vm.zig").VM.arrayRetain(headers_arr);
+    defer ctx.vm.arrayRelease(headers_arr);
+    var hd = CurlHeaderData{
+        .ctx = ctx,
+        .headers = headers_arr,
+    };
+
     _ = c_curl.curl_easy_setopt(handle, c_curl.CURLOPT_WRITEFUNCTION, @as(?*const fn ([*]u8, usize, usize, *anyopaque) callconv(.c) usize, &curlWriteCallback));
     _ = c_curl.curl_easy_setopt(handle, c_curl.CURLOPT_WRITEDATA, @as(*anyopaque, @ptrCast(&wd)));
+    _ = c_curl.curl_easy_setopt(handle, c_curl.CURLOPT_HEADERFUNCTION, @as(?*const fn ([*]u8, usize, usize, *anyopaque) callconv(.c) usize, &curlHeaderCallback));
+    _ = c_curl.curl_easy_setopt(handle, c_curl.CURLOPT_HEADERDATA, @as(*anyopaque, @ptrCast(&hd)));
 
     const result = c_curl.curl_easy_perform(handle);
+    if (!hd.oom and headers_arr.entries.items.len > 0) {
+        @import("../runtime/vm.zig").VM.arrayRetain(headers_arr);
+        ctx.vm.last_http_response_headers = headers_arr;
+    }
     if (result != c_curl.CURLE_OK) return .{ .bool = false };
 
     return .{ .string = Value.String.borrowed(try ctx.createString(wd.buffer.items)) };

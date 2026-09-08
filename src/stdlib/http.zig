@@ -26,6 +26,8 @@ pub const entries = .{
     .{ "header_remove", native_header_remove },
     .{ "headers_sent", native_headers_sent },
     .{ "headers_list", native_headers_list },
+    .{ "http_get_last_response_headers", native_http_get_last_response_headers },
+    .{ "http_clear_last_response_headers", native_http_clear_last_response_headers },
 };
 
 fn isCallable(v: Value) bool {
@@ -293,6 +295,19 @@ fn native_headers_list(ctx: *NativeContext, _: []const Value) RuntimeError!Value
     return .{ .array = try ctx.createArray() };
 }
 
+fn native_http_get_last_response_headers(ctx: *NativeContext, _: []const Value) RuntimeError!Value {
+    if (ctx.vm.last_http_response_headers) |arr| {
+        return .{ .array = try ctx.vm.cloneArray(arr) };
+    }
+    return .null;
+}
+
+fn native_http_clear_last_response_headers(ctx: *NativeContext, _: []const Value) RuntimeError!Value {
+    if (ctx.vm.last_http_response_headers) |arr| ctx.vm.arrayRelease(arr);
+    ctx.vm.last_http_response_headers = null;
+    return .null;
+}
+
 fn appendCookieOptionsArray(buf: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, opts: *PhpArray) !void {
     const expires = opts.get(.{ .string = Value.String.borrowed("expires") });
     if (expires == .int and expires.int > 0) {
@@ -362,7 +377,7 @@ fn getResponseHeaders(ctx: *NativeContext) ?*PhpArray {
     return ctx.vm.response_headers;
 }
 
-fn appendResponseHeader(ctx: *NativeContext, hdr: []const u8) !void {
+pub fn appendResponseHeader(ctx: *NativeContext, hdr: []const u8) !void {
     if (ctx.vm.response_headers) |arr| {
         try arr.append(ctx.allocator, .{ .string = Value.String.borrowed(hdr) });
     } else {
