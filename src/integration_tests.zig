@@ -1804,3 +1804,198 @@ test "hash raw output length" {
         \\echo strlen(hash("sha256", "test", true));
     , "32");
 }
+
+test "discarded concatenations release allocations between batches" {
+    var gpa = std.heap.DebugAllocator(.{ .enable_memory_limit = true }){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("string batch leak");
+    const alloc = gpa.allocator();
+    const source =
+        \\<?php
+        \\$held = ['retained-' . 1, strtoupper('retained-' . 2)];
+        \\function verifyHeld() {
+        \\    global $held;
+        \\    echo implode(',', $held);
+        \\}
+        \\function batch() {
+        \\    for ($i = 0; $i < 1000; ++$i) {
+        \\        $a = 'temporary-' . $i;
+        \\        $b = $a . '-suffix';
+        \\        $c = 'prefix';
+        \\        $c .= $b;
+        \\        $c .= $i;
+        \\        $upper = strtoupper($c);
+        \\        $trimmed = trim($upper);
+        \\        $repeated = str_repeat($trimmed, 2);
+        \\        $joined = implode(':', [$upper, $repeated]);
+        \\    }
+        \\}
+    ;
+    var ast = try parser.parse(alloc, source);
+    defer ast.deinit();
+    var result = try @import("pipeline/compiler.zig").compile(&ast, alloc);
+    defer result.deinit();
+    const vm = try VM.initOnHeap(alloc);
+    defer {
+        vm.deinit();
+        alloc.destroy(vm);
+    }
+    try vm.interpret(&result);
+    for (0..3) |_| {
+        _ = try vm.callByName("batch", &.{});
+        _ = try vm.callByName("gc_collect_cycles", &.{});
+    }
+    const warm_bytes = gpa.total_requested_bytes;
+    const warm_strings = vm.strings.items.len;
+    for (0..20) |_| {
+        _ = try vm.callByName("batch", &.{});
+        _ = try vm.callByName("gc_collect_cycles", &.{});
+        try std.testing.expectEqual(warm_strings, vm.strings.items.len);
+        try std.testing.expectEqual(warm_bytes, gpa.total_requested_bytes);
+    }
+    _ = try vm.callByName("verifyHeld", &.{});
+    try std.testing.expectEqualStrings("retained-1,RETAINED-2", vm.output.items);
+}
+
+test "discarded split strings release allocations between batches" {
+    var gpa = std.heap.DebugAllocator(.{ .enable_memory_limit = true }){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("string batch leak");
+    const alloc = gpa.allocator();
+    const source =
+        \\<?php
+        \\$held = [explode(':', 'retained-' . '1:extra', -1)[0], implode('', str_split('RETAINED-' . 2, 3))];
+        \\function verifyHeld() {
+        \\    global $held;
+        \\    echo implode(',', $held);
+        \\}
+        \\function batch() {
+        \\    for ($i = 0; $i < 1000; ++$i) {
+        \\        $a = 'temporary-' . $i;
+        \\        $b = $a . '-suffix';
+        \\        $c = 'prefix';
+        \\        $c .= $b;
+        \\        $c .= $i;
+        \\        $upper = strtoupper($c);
+        \\        $trimmed = trim($upper);
+        \\        $repeated = str_repeat($trimmed, 2);
+        \\        $joined = implode(':', [$upper, $repeated]);
+        \\        $parts = explode(':', $joined);
+        \\        $limited = explode(':', $joined, -1);
+        \\        $tail = explode(':', $joined, 1);
+        \\        $chunks = str_split($joined, 7);
+        \\    }
+        \\}
+    ;
+    var ast = try parser.parse(alloc, source);
+    defer ast.deinit();
+    var result = try @import("pipeline/compiler.zig").compile(&ast, alloc);
+    defer result.deinit();
+    const vm = try VM.initOnHeap(alloc);
+    defer {
+        vm.deinit();
+        alloc.destroy(vm);
+    }
+    try vm.interpret(&result);
+    for (0..3) |_| {
+        _ = try vm.callByName("batch", &.{});
+        _ = try vm.callByName("gc_collect_cycles", &.{});
+    }
+    const warm_bytes = gpa.total_requested_bytes;
+    const warm_strings = vm.strings.items.len;
+    for (0..20) |_| {
+        _ = try vm.callByName("batch", &.{});
+        _ = try vm.callByName("gc_collect_cycles", &.{});
+        try std.testing.expectEqual(warm_strings, vm.strings.items.len);
+        try std.testing.expectEqual(warm_bytes, gpa.total_requested_bytes);
+    }
+    _ = try vm.callByName("verifyHeld", &.{});
+    try std.testing.expectEqualStrings("retained-1,RETAINED-2", vm.output.items);
+}
+
+test "discarded replacement strings release allocations between batches" {
+    var gpa = std.heap.DebugAllocator(.{ .enable_memory_limit = true }){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("string batch leak");
+    const alloc = gpa.allocator();
+    const source =
+        \\<?php
+        \\$held = [str_replace('x', 'retained', 'x-1'), preg_replace('/x/', 'RETAINED', 'x-2')];
+        \\function verifyHeld() { global $held; echo implode(',', $held); }
+        \\function replacementCallback($matches) { return strtoupper($matches[0]); }
+        \\function batch() {
+        \\    for ($i = 0; $i < 1000; ++$i) {
+        \\        $s = 'temporary-' . $i;
+        \\        $a = str_replace(['temporary', '-'], ['value', ':'], $s);
+        \\        $b = preg_replace('/[0-9]+/', 'digits', $s);
+        \\        $c = preg_replace_callback('/[0-9]+/', 'replacementCallback', $s);
+        \\    }
+        \\}
+    ;
+    var ast = try parser.parse(alloc, source);
+    defer ast.deinit();
+    var result = try @import("pipeline/compiler.zig").compile(&ast, alloc);
+    defer result.deinit();
+    const vm = try VM.initOnHeap(alloc);
+    defer {
+        vm.deinit();
+        alloc.destroy(vm);
+    }
+    try vm.interpret(&result);
+    for (0..3) |_| {
+        _ = try vm.callByName("batch", &.{});
+        _ = try vm.callByName("gc_collect_cycles", &.{});
+    }
+    const warm_bytes = gpa.total_requested_bytes;
+    const warm_strings = vm.strings.items.len;
+    for (0..20) |_| {
+        _ = try vm.callByName("batch", &.{});
+        _ = try vm.callByName("gc_collect_cycles", &.{});
+        try std.testing.expectEqual(warm_strings, vm.strings.items.len);
+        try std.testing.expectEqual(warm_bytes, gpa.total_requested_bytes);
+    }
+    _ = try vm.callByName("verifyHeld", &.{});
+    try std.testing.expectEqualStrings("retained-1,RETAINED-2", vm.output.items);
+}
+
+test "discarded regex captures release allocations between batches" {
+    var gpa = std.heap.DebugAllocator(.{ .enable_memory_limit = true }){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("string batch leak");
+    const alloc = gpa.allocator();
+    const source =
+        \\<?php
+        \\preg_match('/(?<word>retained)-([0-9]+)/', 'retained-' . 1, $heldMatch);
+        \\$heldSplit = preg_split('/:/', 'RETAINED-' . '2:extra');
+        \\$held = [$heldMatch['word'] . '-' . $heldMatch[2], $heldSplit[0]];
+        \\function verifyHeld() { global $held; echo implode(',', $held); }
+        \\function batch() {
+        \\    for ($i = 0; $i < 1000; ++$i) {
+        \\        $s = 'temporary-' . $i . ':again-2';
+        \\        preg_match('/(?<word>[a-z]+)-([0-9]+)/', $s, $one);
+        \\        preg_match_all('/(?<word>[a-z]+)-([0-9]+)/', $s, $all);
+        \\        $parts = preg_split('/([-:])/', $s, -1, PREG_SPLIT_DELIM_CAPTURE);
+        \\    }
+        \\}
+    ;
+    var ast = try parser.parse(alloc, source);
+    defer ast.deinit();
+    var result = try @import("pipeline/compiler.zig").compile(&ast, alloc);
+    defer result.deinit();
+    const vm = try VM.initOnHeap(alloc);
+    defer {
+        vm.deinit();
+        alloc.destroy(vm);
+    }
+    try vm.interpret(&result);
+    for (0..3) |_| {
+        _ = try vm.callByName("batch", &.{});
+        _ = try vm.callByName("gc_collect_cycles", &.{});
+    }
+    const warm_bytes = gpa.total_requested_bytes;
+    const warm_strings = vm.strings.items.len;
+    for (0..20) |_| {
+        _ = try vm.callByName("batch", &.{});
+        _ = try vm.callByName("gc_collect_cycles", &.{});
+        try std.testing.expectEqual(warm_strings, vm.strings.items.len);
+        try std.testing.expectEqual(warm_bytes, gpa.total_requested_bytes);
+    }
+    _ = try vm.callByName("verifyHeld", &.{});
+    try std.testing.expectEqualStrings("retained-1,RETAINED-2", vm.output.items);
+}

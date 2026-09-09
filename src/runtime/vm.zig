@@ -98,15 +98,6 @@ pub const NativeContext = struct {
         return self.vm.callByName(name, args);
     }
 
-    // native result contract: an owned string result is a transferred
-    // reference, objects and arrays are borrowed. a native handing back a
-    // string it does not own (a registry entry, a container element) must
-    // add the reference the caller will consume
-    pub fn returnShared(self: *NativeContext, value: Value) void {
-        _ = self;
-        if (value == .string) value.string.retain();
-    }
-
     pub fn callMethod(self: *NativeContext, obj: *PhpObject, method: []const u8, args: []const Value) RuntimeError!Value {
         return self.vm.callMethod(obj, method, args);
     }
@@ -117,10 +108,15 @@ pub const NativeContext = struct {
             if (arg_index < args.len) args[arg_index] = value;
         }
         if (vm.frame_count == 0) return;
-        const arg_sources = vm.scanCallerArgSources(arg_count);
+        const arg_sources = vm.callerArgSources(arg_count);
+        if (arg_index >= arg_sources.len) return;
         const caller = vm.currentFrame();
 
         switch (arg_sources[arg_index]) {
+            .cell => |c| {
+                vm.setCell(c.value, value);
+                vm.propagateCellWrite(c.value, value) catch {};
+            },
             .simple => |var_name| {
                 if (VM.isSuperglobal(var_name)) {
                     vm.putRequestVar(var_name, value) catch {};
@@ -155,33 +151,6 @@ pub const NativeContext = struct {
                     vm.releaseValue(old);
                 } else if (old_local) |old| {
                     vm.releaseValue(old);
-                }
-            },
-            .array_elem => |ae| {
-                const arr_val = vm.resolveCallerVar(ae.var_name, ae.is_local, ae.slot);
-                if (arr_val == .array) {
-                    vm.arraySetOwned(arr_val.array, Value.toArrayKey(ae.key), value) catch return;
-                }
-            },
-            .object_prop => |op| {
-                const obj_val = vm.resolveCallerVar(op.var_name, op.is_local, op.slot);
-                if (obj_val == .object) {
-                    vm.objectSetOwned(obj_val.object, op.prop_name, value) catch return;
-                }
-            },
-            .chained_prop => |cp| {
-                vm.objectSetOwned(cp.object, cp.prop_name, value) catch return;
-            },
-            .resolved_array_elem => |ae| {
-                ae.array.set(vm.allocator, Value.toArrayKey(ae.key), value) catch return;
-            },
-            .prop_array_elem => |pae| {
-                const obj_val = vm.resolveCallerVar(pae.var_name, pae.is_local, pae.slot);
-                if (obj_val == .object) {
-                    const prop_val = obj_val.object.get(pae.prop_name);
-                    if (prop_val == .array) {
-                        prop_val.array.set(vm.allocator, Value.toArrayKey(pae.key), value) catch return;
-                    }
                 }
             },
             .none => {},
@@ -253,7 +222,8 @@ pub const NativeContext = struct {
     }
 };
 
-const NativeFn = *const fn (*NativeContext, []const Value) RuntimeError!Value;
+pub const NativeResult = @import("native_result.zig").NativeResult;
+const NativeFn = *const fn (*NativeContext, []const Value) RuntimeError!NativeResult;
 
 pub const CaptureEntry = struct {
     closure_name: []const u8,
@@ -262,36 +232,14 @@ pub const CaptureEntry = struct {
     ref_cell: ?*Value = null,
 };
 
+// where an evaluated argument came from, recorded only when the call it
+// feeds may bind that position by reference. `simple` names a caller
+// variable; `cell` is the canonical reference cell of a property or array
+// element, carrying the error text if the current scope may not write it
 const RefSource = union(enum) {
     none,
     simple: []const u8,
-    array_elem: struct {
-        var_name: []const u8,
-        is_local: bool,
-        slot: u16,
-        key: Value,
-    },
-    object_prop: struct {
-        var_name: []const u8,
-        is_local: bool,
-        slot: u16,
-        prop_name: []const u8,
-    },
-    chained_prop: struct {
-        object: *PhpObject,
-        prop_name: []const u8,
-    },
-    resolved_array_elem: struct {
-        array: *PhpArray,
-        key: Value,
-    },
-    prop_array_elem: struct {
-        var_name: []const u8,
-        is_local: bool,
-        slot: u16,
-        prop_name: []const u8,
-        key: Value,
-    },
+    cell: struct { value: *Value, denial: ?[]const u8 = null },
 };
 
 pub const CaptureRange = struct {
@@ -382,6 +330,7 @@ pub const ClassDef = struct {
         is_readonly: bool = false,
         is_final: bool = false,
         is_promoted: bool = false,
+        is_virtual: bool = false,
         type_str: []const u8 = "",
         doc_comment: []const u8 = "",
     };
@@ -572,6 +521,8 @@ pub const VM = struct {
     fiber_suspend_value: Value = .null,
     captures: std.ArrayListUnmanaged(CaptureEntry) = .{},
     capture_index: std.StringHashMapUnmanaged(CaptureRange) = .{},
+    cycle_closures: std.AutoArrayHashMapUnmanaged(*Value.String.Owner, i64) = .{},
+    collecting_cycles: bool = false,
     closure_instance_count: u32 = 0,
     captures_dead: usize = 0,
     // ZPHP_HEAP_STATS diagnostics: every live closure owner, so survivors of
@@ -728,6 +679,7 @@ pub const VM = struct {
     exception_dispatched: bool = false,
     run_base_frame: usize = 0,
     allocator: Allocator,
+    string_pool: @import("string_pool.zig") = .{ .backing = undefined },
     global_slot_names: []const []const u8 = &.{},
     script_strict_types: bool = false,
     // most recent ICU UErrorCode from any intl native call. reset to 0 on entry
@@ -740,6 +692,8 @@ pub const VM = struct {
     // script's layout, not the most-recently-required file's
     top_slot_names: []const []const u8 = &.{},
     global_vars_dirty: bool = false,
+    method_cache_class_storage: [256]u8 = undefined,
+    method_cache_method_storage: [256]u8 = undefined,
     method_cache_class: []const u8 = "",
     method_cache_method: []const u8 = "",
     method_cache_result: []const u8 = "",
@@ -748,6 +702,8 @@ pub const VM = struct {
     // hasMethod single-entry cache. method dispatch repeatedly probes the
     // same (class, method) pair per call site (decide method-call vs __call
     // fallback) - this skips the bufPrint("{s}::{s}") cost on hits
+    has_method_cache_class_storage: [256]u8 = undefined,
+    has_method_cache_method_storage: [256]u8 = undefined,
     has_method_cache_class: []const u8 = "",
     has_method_cache_method: []const u8 = "",
     has_method_cache_result: bool = false,
@@ -779,6 +735,7 @@ pub const VM = struct {
     response_code: i64 = 200,
     response_content_type: []const u8 = "text/html",
     response_headers: ?*PhpArray = null,
+    last_http_response_headers: ?*PhpArray = null,
     headers_sent: bool = false,
     default_tz_name: []const u8 = "UTC",
     // populated by DateTime/createFromFormat parsers when input is unparseable.
@@ -797,6 +754,12 @@ pub const VM = struct {
     // reference binding exists. lets array reads/writes/clones/foreach skip the
     // per-entry `ref` check in the common case. reset() clears it
     array_ref_active: bool = false,
+    // set by an argument guard whose callee takes that position by reference
+    // or cannot be resolved yet; consumed by the fetch opcode right after it
+    arg_capture_pending: bool = false,
+    // exclusive high-water mark of provenance writes in ic.arg_stack,
+    // independent of sp: fastLoop pops values without visiting the transport
+    arg_source_end: usize = 0,
     // cell-keyed reference-binding registry (O(1) propagateCellWrite + prop sync).
     // lazily allocated on first ref binding so non-ref programs pay one nullable
     // pointer and nothing else. coexists with the legacy frame/vm binding lists
@@ -1010,10 +973,12 @@ pub const VM = struct {
     }
 
     fn regRefArray(self: *VM, owner: RefIndex.OwnerId, cell: *Value, arr: *PhpArray, key: PhpArray.Key) RuntimeError!void {
-        try (try self.refIndex()).addOwned(self.allocator, owner, cell, .{ .array = .{ .array = arr, .key = key } });
+        const entry = arr.getPtr(key) orelse return;
+        try (try self.refIndex()).addOwned(self.allocator, owner, cell, .{ .array = .{ .array = arr, .key = entry.key } });
     }
     fn regRefObject(self: *VM, owner: RefIndex.OwnerId, cell: *Value, obj: *PhpObject, prop_name: []const u8) RuntimeError!void {
         try (try self.refIndex()).addOwned(self.allocator, owner, cell, .{ .object = .{ .object = obj, .prop_name = prop_name } });
+        obj.ref_mirrored = true;
     }
     fn regRefStatic(self: *VM, owner: RefIndex.OwnerId, cell: *Value, class_name: []const u8, prop_name: []const u8) RuntimeError!void {
         try (try self.refIndex()).addOwned(self.allocator, owner, cell, .{ .static = .{ .class_name = class_name, .prop_name = prop_name } });
@@ -1145,9 +1110,27 @@ pub const VM = struct {
     fn unregFrameBindings(self: *VM, frame: anytype) void {
         if (frame.ref_owner == 0) return;
         if (self.ref_index) |ri| ri.releaseOwner(self.allocator, frame.ref_owner);
+        self.releaseBoundArgSources(frame.ref_owner);
     }
 
+    const ArgEntry = struct { array: *PhpArray, key: PhpArray.Key, source: RefSource };
+
     pub const InlineCache = struct {
+        // argument guard sites: keyed by (chunk_ptr ^ guard ip); `guard` is the
+        // identity of the receiver/callable read from the stack and
+        // `generation` the function+class registry size, so a site re-resolves
+        // when a different class arrives or new code is declared
+        intent: []IntentIC = &.{},
+        arg_stack: []RefSource = &.{},
+        // provenance of the call family opcode being executed, saved across a
+        // nested call so a native callback's own calls cannot clobber it
+        saved_sources: std.ArrayListUnmanaged(RefSource) = .{},
+        arg_arrays: std.ArrayListUnmanaged(ArgEntry) = .{},
+        bound_arg_sources: std.ArrayListUnmanaged(struct { owner: RefIndex.OwnerId, source: RefSource }) = .{},
+        active_args: []RefSource = &.{},
+        active_frame: usize = 0,
+        active_arg_count: usize = 0,
+
         // property access: keyed by (chunk_ptr ^ ip), stores class_ptr for visibility skip
         prop: [128]PropIC = @splat(.{}),
         // method call: keyed by (chunk_ptr ^ ip), stores class_ptr + resolved func
@@ -1192,6 +1175,20 @@ pub const VM = struct {
             native: ?NativeFn = null,
             full_name: []const u8 = "",
         };
+
+        const IntentIC = struct {
+            key: usize = 0,
+            chunk_key: usize = 0,
+            guard: usize = 0,
+            generation: usize = 0,
+            // which stack slots below the arguments identify the callee
+            slots: u8 = 0,
+            capture: bool = true,
+        };
+
+        pub fn intentIndex(chunk_ptr: usize, ip: usize) u9 {
+            return @truncate((chunk_ptr ^ ip) *% 0x517CC1B727220A95);
+        }
 
         pub fn propIndex(chunk_ptr: usize, ip: usize) u7 {
             return @truncate((chunk_ptr ^ ip) *% 0x517CC1B727220A95);
@@ -1274,7 +1271,13 @@ pub const VM = struct {
             break :blk created;
         };
         self.next_object_id += 1;
-        obj.* = .{ .class_name = class_name, .id = self.next_object_id };
+        const stable_class_name = if (self.classes.getKey(class_name)) |registered| registered else blk: {
+            const owned = try self.allocator.dupe(u8, class_name);
+            errdefer self.allocator.free(owned);
+            try self.strings.append(self.allocator, owned);
+            break :blk owned;
+        };
+        obj.* = .{ .class_name = stable_class_name, .id = self.next_object_id };
         if (self.debug_trace_class) |trace_class| if (std.mem.eql(u8, trace_class, class_name)) {
             @import("value.zig").trace_obj = obj;
             @import("value.zig").trace_rc_verbose = true;
@@ -1335,7 +1338,12 @@ pub const VM = struct {
         return vm;
     }
 
+    pub fn stringAllocator(self: *VM) Allocator {
+        return self.string_pool.allocator();
+    }
+
     fn initVm(vm: *VM, allocator: Allocator) RuntimeError!void {
+        vm.string_pool.backing = allocator;
         if (std.posix.getenv("ZPHP_HEAP_STATS") != null) vm.debug_closure_owners = .{};
         if (std.posix.getenv("ZPHP_NO_POOL") != null) vm.debug_no_pool = true;
         if (std.posix.getenv("ZPHP_GC_VERIFY") != null) vm.debug_gc_verify = true;
@@ -1348,6 +1356,12 @@ pub const VM = struct {
         vm.error_reporting_level = 30719;
         vm.ic = try allocator.create(InlineCache);
         vm.ic.?.* = .{};
+        vm.ic.?.arg_stack = try allocator.alloc(RefSource, 2048);
+        @memset(vm.ic.?.arg_stack, .none);
+        vm.ic.?.active_args = try allocator.alloc(RefSource, 256);
+        @memset(vm.ic.?.active_args, .none);
+        vm.ic.?.intent = try allocator.alloc(InlineCache.IntentIC, 512);
+        @memset(vm.ic.?.intent, .{});
         const locals_buf = try allocator.alloc(Value, 8192);
         vm.ic.?.locals_buf = locals_buf.ptr;
         vm.ic.?.locals_cap = 8192;
@@ -2285,8 +2299,21 @@ pub const VM = struct {
         defer self.heap_teardown = false;
         // static state (class static props, function statics, superglobals)
         // holds owned values that no frame releases
+        var constant_it = self.php_constants.valueIterator();
+        while (constant_it.next()) |value| {
+            if (value.* == .string) {
+                self.releaseValue(value.*);
+                value.* = .null;
+            }
+        }
         var class_it = self.classes.valueIterator();
         while (class_it.next()) |class| {
+            for (class.properties.items) |*property| {
+                if (property.default == .string) {
+                    self.releaseValue(property.default);
+                    property.default = .null;
+                }
+            }
             var sp_it = class.static_props.valueIterator();
             while (sp_it.next()) |value| {
                 self.releaseValue(value.*);
@@ -2370,9 +2397,9 @@ pub const VM = struct {
         }
         for (self.objects.items[obj_start..]) |o| {
             if (!o.pooled) {
-                if (o.lazy_initializer == .string) {
-                    self.releaseValue(o.lazy_initializer);
-                    o.lazy_initializer = .null;
+                if (o.lazyInitializer() == .string) {
+                    self.releaseValue(o.lazyInitializer());
+                    o.lazy.?.initializer = .null;
                 }
                 if (o.slots) |slots| {
                     for (slots) |*slot| {
@@ -2480,6 +2507,10 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
+        if (self.ic) |ic| for (ic.arg_stack) |*source| self.releaseArgSource(source);
+        self.clearActiveArgSources();
+        self.clearArgArraySources(null);
+        self.releaseBoundArgSources(null);
         if (std.posix.getenv("ZPHP_HEAP_STATS") != null) self.printHeapStats();
         self.releaseFrames();
         self.releaseCallbackRegistries();
@@ -2500,6 +2531,12 @@ pub const VM = struct {
         self.builtin_classes.deinit(self.allocator);
         self.builtin_interfaces.deinit(self.allocator);
         if (self.ic) |ic_ptr| {
+            ic_ptr.arg_arrays.deinit(self.allocator);
+            ic_ptr.bound_arg_sources.deinit(self.allocator);
+            ic_ptr.saved_sources.deinit(self.allocator);
+            self.allocator.free(ic_ptr.arg_stack);
+            self.allocator.free(ic_ptr.active_args);
+            self.allocator.free(ic_ptr.intent);
             ic_ptr.concat_buf.deinit(self.allocator);
             if (ic_ptr.locals_cap > 0) self.allocator.free(ic_ptr.locals_buf[0..ic_ptr.locals_cap]);
             self.allocator.destroy(ic_ptr);
@@ -2555,6 +2592,7 @@ pub const VM = struct {
         self.pending_destruct.deinit(self.allocator);
         self.pending_array_release.deinit(self.allocator);
         self.pending_string_release.deinit(self.allocator);
+        self.string_pool.deinit();
         self.pending_gen_release.deinit(self.allocator);
         self.pending_fiber_release.deinit(self.allocator);
         self.weakmaps.deinit(self.allocator);
@@ -2630,6 +2668,15 @@ pub const VM = struct {
     }
 
     pub fn reset(self: *VM) void {
+        if (self.ic) |ic| {
+            for (ic.arg_stack) |*source| self.releaseArgSource(source);
+            self.clearActiveArgSources();
+            self.clearArgArraySources(null);
+            self.releaseBoundArgSources(null);
+            ic.active_frame = 0;
+            self.arg_source_end = 0;
+            ic.arg_arrays.clearRetainingCapacity();
+        }
         self.installHooks();
         self.releaseFrames();
         self.releaseCallbackRegistries();
@@ -2712,6 +2759,7 @@ pub const VM = struct {
         self.response_code = 200;
         self.response_content_type = "text/html";
         self.response_headers = null;
+        self.last_http_response_headers = null;
         self.headers_sent = false;
         self.default_tz_name = "UTC";
         self.default_tz_offset = 0;
@@ -2740,6 +2788,7 @@ pub const VM = struct {
             while (ctfn_it.next()) |e| e.value_ptr.*.deinit(self.allocator);
             self.chunk_to_func_names.clearRetainingCapacity();
             self.php_constants.clearRetainingCapacity();
+            self.user_constants.clearRetainingCapacity();
             initConstants(&self.php_constants, self.allocator) catch {};
             // builtins persist across reset now (freeClassState kept them), so the
             // stdlib classes + their native methods + enum objects DON'T need
@@ -2855,7 +2904,7 @@ pub const VM = struct {
             if (obj.destructed) continue;
             if (self.pendingExceptionIs(obj)) continue;
             obj.destructed = true;
-            if (self.hasMethod(obj.class_name, "__destruct")) {
+            if (obj.ownsDestructor() and self.hasMethod(obj.class_name, "__destruct")) {
                 _ = self.callMethod(obj, "__destruct", &.{}) catch {
                     self.pending_exception = null;
                 };
@@ -3004,7 +3053,7 @@ pub const VM = struct {
             }
         }
         for (caller_slot_names, 0..) |name, caller_slot| {
-            if (name.len == 0 or caller_slot >= caller.locals.len or inherited_vars.contains(name)) continue;
+            if (name.len == 0 or caller_slot >= caller.locals.len) continue;
             try inherited_vars.put(self.allocator, name, caller.locals[caller_slot]);
         }
         const saved_slot_names = self.global_slot_names;
@@ -3035,6 +3084,7 @@ pub const VM = struct {
             }
             self.global_slot_names = saved_slot_names;
             self.script_strict_types = saved_strict;
+            self.clearArgStackFrom(sp_before_eval);
             self.sp = sp_before_eval;
             return error.RuntimeError;
         };
@@ -3051,6 +3101,7 @@ pub const VM = struct {
         // stack is unchanged
         if (self.sp > sp_before_eval) {
             const r = self.stack[self.sp - 1];
+            self.clearArgStackFrom(sp_before_eval);
             self.sp = sp_before_eval;
             return r;
         }
@@ -3120,6 +3171,8 @@ pub const VM = struct {
     }
 
     fn runLoop(self: *VM, base_frame: usize) RuntimeError!void {
+        // the dispatch body inlines readByte/readU16/push at thousands of sites
+        @setEvalBranchQuota(100000);
         const prev_base_frame = self.run_base_frame;
         self.run_base_frame = base_frame;
         defer self.run_base_frame = prev_base_frame;
@@ -3410,35 +3463,38 @@ pub const VM = struct {
                 .concat => {
                     const b = self.pop();
                     const a = self.pop();
+                    VM.retainValue(a);
+                    VM.retainValue(b);
+                    defer self.releaseValue(a);
+                    defer self.releaseValue(b);
                     if (a == .string and b == .string) {
                         const as = a.string.bytes();
                         const bs = b.string.bytes();
-                        const owned = try self.allocator.alloc(u8, as.len + bs.len);
+                        const owned = try self.stringAllocator().alloc(u8, as.len + bs.len);
                         @memcpy(owned[0..as.len], as);
                         @memcpy(owned[as.len..], bs);
-                        try self.strings.append(self.allocator, owned);
-                        self.push(.{ .string = Value.String.borrowed(owned) });
+                        self.pushTransfer(.{ .string = try Value.String.adopt(self.stringAllocator(), owned) });
                     } else {
                         if (a == .array) self.emitWarning("Array to string conversion");
                         if (b == .array) self.emitWarning("Array to string conversion");
                         var buf = std.ArrayListUnmanaged(u8){};
+                        defer buf.deinit(self.stringAllocator());
                         if (a == .object) {
                             const s = self.objectToString(a.object) catch {
                                 if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
                                 return error.RuntimeError;
                             };
-                            try buf.appendSlice(self.allocator, s);
-                        } else try a.format(&buf, self.allocator);
+                            try buf.appendSlice(self.stringAllocator(), s);
+                        } else try a.format(&buf, self.stringAllocator());
                         if (b == .object) {
                             const s = self.objectToString(b.object) catch {
                                 if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
                                 return error.RuntimeError;
                             };
-                            try buf.appendSlice(self.allocator, s);
-                        } else try b.format(&buf, self.allocator);
-                        const owned = try buf.toOwnedSlice(self.allocator);
-                        try self.strings.append(self.allocator, owned);
-                        self.push(.{ .string = Value.String.borrowed(owned) });
+                            try buf.appendSlice(self.stringAllocator(), s);
+                        } else try b.format(&buf, self.stringAllocator());
+                        const owned = try buf.toOwnedSlice(self.stringAllocator());
+                        self.pushTransfer(.{ .string = try Value.String.adopt(self.stringAllocator(), owned) });
                     }
                 },
 
@@ -3599,13 +3655,20 @@ pub const VM = struct {
                 },
 
                 .call => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const name_idx = self.readU16();
                     const arg_count = self.readByte();
                     const name = self.currentChunk().constants.items[name_idx].string.bytes();
                     if (self.global_vars_dirty) try self.syncGlobalLocalsToVars();
-                    try self.callNamedFunction(name, arg_count);
+                    self.callNamedFunction(name, arg_count) catch {
+                        if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                        return error.RuntimeError;
+                    };
                 },
                 .call_indirect => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     if (self.global_vars_dirty) try self.syncGlobalLocalsToVars();
                     const arg_count = self.readByte();
                     const ac: usize = arg_count;
@@ -3615,13 +3678,18 @@ pub const VM = struct {
                         var i: usize = 0;
                         while (i < ac) : (i += 1) {
                             self.stack[self.sp - ac - 1 + i] = self.stack[self.sp - ac + i];
+                            self.setArgSource(self.sp - ac - 1 + i, self.ic.?.arg_stack[self.sp - ac + i]);
                         }
+                        self.clearArgStackFrom(self.sp - 1);
                         self.sp -= 1;
                         // the closure value slot is consumed here; the callee
                         // frame retains the instance by call_name, and the
                         // deferred release keeps the name alive until then
                         self.stackRelease(name_val);
-                        try self.callNamedFunction(name, arg_count);
+                        self.callNamedFunction(name, arg_count) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
                     } else if (name_val == .object) {
                         var args_buf: [16]Value = undefined;
                         for (0..ac) |i| args_buf[i] = self.stack[self.sp - ac + i];
@@ -3676,6 +3744,8 @@ pub const VM = struct {
                     }
                 },
                 .call_spread => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     if (self.global_vars_dirty) try self.syncGlobalLocalsToVars();
                     const name_idx = self.readU16();
                     const name = self.currentChunk().constants.items[name_idx].string.bytes();
@@ -3704,6 +3774,8 @@ pub const VM = struct {
                     if (has_named) {
                         if (self.functions.get(name)) |func| {
                             var resolved: [256]Value = .{.null} ** 256;
+                            var resolved_sources: [256]RefSource = undefined;
+                            @memset(resolved_sources[0..@min(resolved_sources.len, func.params.len + arr.entries.items.len)], .none);
                             if (func.params.len > resolved.len) return error.RuntimeError;
                             var assigned: [16]bool = .{false} ** 16;
                             var pos: usize = 0;
@@ -3728,6 +3800,7 @@ pub const VM = struct {
                                                 return error.RuntimeError;
                                             }
                                             resolved[pi] = entry.value;
+                                            resolved_sources[pi] = self.argArraySource(arr, entry.key);
                                             assigned[pi] = true;
                                             if (pi >= pos) pos = pi + 1;
                                             found = true;
@@ -3791,6 +3864,7 @@ pub const VM = struct {
                                         ok = true;
                                     }
                                     resolved[pos] = entry.value;
+                                    resolved_sources[pos] = self.argArraySource(arr, entry.key);
                                     assigned[pos] = true;
                                     pos += 1;
                                 }
@@ -3802,10 +3876,18 @@ pub const VM = struct {
                                     resolved[i] = try self.resolveDefault(func.defaults[i]);
                                 }
                             }
-                            for (0..count) |i| self.push(resolved[i]);
-                            try self.callNamedFunctionV(name, @intCast(count), named_extras);
+                            for (0..count) |i| {
+                                self.push(resolved[i]);
+                                self.setArgSource(self.sp - 1, resolved_sources[i]);
+                            }
+                            self.callNamedFunctionV(name, @intCast(count), named_extras) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
                         } else if (@import("../stdlib/native_params.zig").map.get(name)) |params| {
                             var resolved: [256]Value = .{.null} ** 256;
+                            var resolved_sources: [256]RefSource = undefined;
+                            @memset(resolved_sources[0..@min(resolved_sources.len, params.len + arr.entries.items.len)], .none);
                             if (params.len > resolved.len) return error.RuntimeError;
                             var pos: usize = 0;
                             for (arr.entries.items) |entry| {
@@ -3813,20 +3895,31 @@ pub const VM = struct {
                                     for (params, 0..) |p, pi| {
                                         if (std.mem.eql(u8, p[1..], entry.key.string.bytes()) or std.mem.eql(u8, p, entry.key.string.bytes())) {
                                             resolved[pi] = entry.value;
+                                            resolved_sources[pi] = self.argArraySource(arr, entry.key);
                                             if (pi >= pos) pos = pi + 1;
                                             break;
                                         }
                                     }
                                 } else {
                                     resolved[pos] = entry.value;
+                                    resolved_sources[pos] = self.argArraySource(arr, entry.key);
                                     pos += 1;
                                 }
                             }
-                            for (0..pos) |i| self.push(resolved[i]);
-                            try self.callNamedFunction(name, @intCast(pos));
+                            for (0..pos) |i| {
+                                self.push(resolved[i]);
+                                self.setArgSource(self.sp - 1, resolved_sources[i]);
+                            }
+                            self.callNamedFunction(name, @intCast(pos)) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
                         } else {
-                            for (arr.entries.items) |entry| self.push(entry.value);
-                            try self.callNamedFunction(name, @intCast(arr.entries.items.len));
+                            for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
+                            self.callNamedFunction(name, @intCast(arr.entries.items.len)) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
                         }
                     } else {
                         const ref_func = self.functions.get(name);
@@ -3860,12 +3953,17 @@ pub const VM = struct {
                             }
                             self.pushCallResult(result);
                         } else {
-                            for (arr.entries.items) |entry| self.push(entry.value);
-                            try self.callNamedFunction(name, @intCast(arr.entries.items.len));
+                            for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
+                            self.callNamedFunction(name, @intCast(arr.entries.items.len)) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
                         }
                     }
                 },
                 .call_indirect_spread => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const name_val = self.pop();
                     const args_val = self.pop();
                     if (args_val != .array) {
@@ -3926,6 +4024,8 @@ pub const VM = struct {
                         if (has_named_args) {
                             if (self.functions.get(name_val.string.bytes())) |func| {
                                 var resolved: [256]Value = .{.null} ** 256;
+                                var resolved_sources: [256]RefSource = undefined;
+                                @memset(resolved_sources[0..@min(resolved_sources.len, func.params.len + arr.entries.items.len)], .none);
                                 if (func.params.len > resolved.len) return error.RuntimeError;
                                 var pos: usize = 0;
                                 for (arr.entries.items) |entry| {
@@ -3934,26 +4034,40 @@ pub const VM = struct {
                                             const pn = if (p.len > 0 and p[0] == '$') p[1..] else p;
                                             if (std.mem.eql(u8, pn, entry.key.string.bytes())) {
                                                 resolved[pi] = entry.value;
+                                                resolved_sources[pi] = self.argArraySource(arr, entry.key);
                                                 if (pi >= pos) pos = pi + 1;
                                                 break;
                                             }
                                         }
                                     } else {
                                         resolved[pos] = entry.value;
+                                        resolved_sources[pos] = self.argArraySource(arr, entry.key);
                                         pos += 1;
                                     }
                                 }
-                                for (0..pos) |i| self.push(resolved[i]);
-                                try self.callNamedFunction(name_val.string.bytes(), @intCast(pos));
+                                for (0..pos) |i| {
+                                    self.push(resolved[i]);
+                                    self.setArgSource(self.sp - 1, resolved_sources[i]);
+                                }
+                                self.callNamedFunction(name_val.string.bytes(), @intCast(pos)) catch {
+                                    if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                    return error.RuntimeError;
+                                };
                             } else {
-                                for (arr.entries.items) |entry| self.push(entry.value);
+                                for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                                 const ac2: u8 = @intCast(arr.entries.items.len);
-                                try self.callNamedFunction(name_val.string.bytes(), ac2);
+                                self.callNamedFunction(name_val.string.bytes(), ac2) catch {
+                                    if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                    return error.RuntimeError;
+                                };
                             }
                         } else {
-                            for (arr.entries.items) |entry| self.push(entry.value);
+                            for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                             const ac: u8 = @intCast(arr.entries.items.len);
-                            try self.callNamedFunction(name_val.string.bytes(), ac);
+                            self.callNamedFunction(name_val.string.bytes(), ac) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
                         }
                     } else if (name_val == .array) {
                         const cb_arr = name_val.array;
@@ -4125,11 +4239,46 @@ pub const VM = struct {
                     }
                     self.push(val);
                 },
-                .array_push => {
+                .reference_source => {
+                    const idx = self.readU16();
+                    const name = self.currentChunk().constants.items[idx].string.bytes();
+                    const frame = self.currentFrame();
+                    const cell = try self.getOrCreateVarCell(frame, name);
+                    self.push(cell.*);
+                    self.setArgSource(self.sp - 1, .{ .cell = .{ .value = cell } });
+                    self.unbindRefSlot(&frame.ref_slots, name);
+                },
+                .array_set_elem_ref, .array_push_ref => {
+                    var source = self.retainArgSource(self.ic.?.arg_stack[self.sp - 1]);
+                    defer self.releaseArgSource(&source);
+                    _ = self.pop();
+                    const key = if (op == .array_set_elem_ref) self.pop() else Value.null;
+                    const array = self.peek().array;
+                    if (key == .array or key == .object) {
+                        if (try self.throwOffsetKeyType(key, .access)) continue;
+                        return error.RuntimeError;
+                    }
+                    const ak = if (op == .array_push_ref)
+                        PhpArray.Key{ .int = if (array.has_int_keys) array.next_int_key else 0 }
+                    else
+                        Value.toArrayKey(key);
+                    if (source != .cell) return error.RuntimeError;
+                    try self.checkArgCell(source.cell.denial);
+                    const cell = source.cell.value;
+                    self.detachArrayEntryRef(array, ak);
+                    try self.arraySetOwned(array, ak, cell.*);
+                    self.setEntryRef(array.getPtr(ak).?, cell);
+                    try self.regRefArray(try self.persistentRefOwner(), cell, array, ak);
+                    self.array_ref_active = true;
+                },
+                .array_push, .arg_array_push => {
+                    var source = if (op == .arg_array_push) self.retainArgSource(self.ic.?.arg_stack[self.sp - 1]) else RefSource.none;
+                    defer self.releaseArgSource(&source);
                     const val = self.popTransfer();
                     const arr_val = self.peek();
                     if (arr_val == .array) {
                         try arr_val.array.append(self.allocator, val);
+                        if (op == .arg_array_push) try self.recordArgArraySource(arr_val.array, arr_val.array.entries.items[arr_val.array.entries.items.len - 1].key, source);
                         self.stackRelease(val);
                     } else if (arr_val == .object and self.hasMethod(arr_val.object.class_name, "offsetSet")) {
                         _ = self.callMethod(arr_val.object, "offsetSet", &.{ .null, val }) catch {
@@ -4146,7 +4295,9 @@ pub const VM = struct {
                         self.stackRelease(val);
                     }
                 },
-                .array_set_elem => {
+                .array_set_elem, .arg_array_set => {
+                    var source = if (op == .arg_array_set) self.retainArgSource(self.ic.?.arg_stack[self.sp - 1]) else RefSource.none;
+                    defer self.releaseArgSource(&source);
                     const val = self.pop();
                     const key = self.pop();
                     const arr_val = self.peek();
@@ -4156,6 +4307,10 @@ pub const VM = struct {
                             return error.RuntimeError;
                         }
                         const norm_key = Value.toArrayKey(key);
+                        if (op == .arg_array_set) try self.recordArgArraySource(arr_val.array, norm_key, source);
+                        // A duplicate literal key replaces storage, not the value
+                        // of the reference previously installed at that key.
+                        if (op == .array_set_elem) self.detachArrayEntryRef(arr_val.array, norm_key);
                         if (!(self.array_ref_active and try self.writeArrayElemRef(arr_val.array, norm_key, val))) {
                             try self.arraySetOwned(arr_val.array, norm_key, val);
                         }
@@ -4167,8 +4322,30 @@ pub const VM = struct {
                     }
                 },
                 .array_get => {
+                    const capturing = self.arg_capture_pending;
+                    self.arg_capture_pending = false;
                     const key = self.pop();
+                    var base_source = if (capturing) self.retainArgSource(self.ic.?.arg_stack[self.sp - 1]) else RefSource.none;
+                    defer self.releaseArgSource(&base_source);
                     const arr_val = self.pop();
+                    const arg_sp = self.sp;
+                    if (capturing) {
+                        retainValue(arr_val);
+                        retainValue(key);
+                    }
+                    defer if (capturing) {
+                        // Removing this temporary lifetime pin does not remove
+                        // a graph edge and cannot create an array cycle. Avoid
+                        // scheduling a full cycle walk of the argument's parent.
+                        if (arr_val == .array) {
+                            arrayUnpin(arr_val.array);
+                            if (arr_val.array.refcount == 0) self.queueArrayRelease(arr_val.array);
+                        } else self.releaseValue(arr_val);
+                        self.releaseValue(key);
+                    };
+                    defer if (capturing and arr_val == .array and self.sp == arg_sp + 1 and self.pending_exception == null) {
+                        self.captureDimensionCell(arg_sp, arr_val.array, key, base_source) catch unreachable;
+                    };
                     if (arr_val == .array) {
                         if (self.globals_array) |ga| {
                             if (arr_val.array == ga and key == .string) {
@@ -4206,7 +4383,7 @@ pub const VM = struct {
                         else
                             null;
                         if (resolved) |ri| {
-                            self.push(.{ .string = string.retainedSlice(ri, ri + 1) });
+                            self.pushTransfer(.{ .string = string.retainedSlice(ri, ri + 1) });
                         } else {
                             self.push(.{ .string = Value.String.borrowed("") });
                         }
@@ -4255,7 +4432,7 @@ pub const VM = struct {
                         else
                             null;
                         if (resolved) |ri| {
-                            self.push(.{ .string = string.retainedSlice(ri, ri + 1) });
+                            self.pushTransfer(.{ .string = string.retainedSlice(ri, ri + 1) });
                         } else {
                             self.push(.null);
                         }
@@ -4347,14 +4524,54 @@ pub const VM = struct {
                     const inner_key = self.pop();
                     const prop_key = self.pop();
                     const base = self.pop();
+                    VM.retainValue(v);
+                    VM.retainValue(inner_key);
+                    VM.retainValue(prop_key);
+                    VM.retainValue(base);
+                    defer self.releaseValue(v);
+                    defer self.releaseValue(inner_key);
+                    defer self.releaseValue(prop_key);
+                    defer self.releaseValue(base);
                     if (base != .object or prop_key != .string) {
                         self.push(v);
                         continue;
                     }
-                    const obj = base.object;
+                    var obj = base.object;
                     const pname = prop_key.string.bytes();
+                    self.triggerLazyProperty(obj, pname, self.currentDefiningClass()) catch {
+                        if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                        return error.RuntimeError;
+                    };
+                    obj = obj.storage();
                     const ik = Value.toArrayKey(inner_key);
-                    const existing = obj.get(pname);
+                    // Hook reads must precede vivification/COW. A by-value hook
+                    // may expose an object for offsetSet, but not writable array storage.
+                    obj.refcount +%= 1;
+                    defer self.releaseValue(.{ .object = obj });
+                    var existing = obj.get(pname);
+                    var hook_cell: ?*Value = null;
+                    defer if (hook_cell) |cell| self.unbindCell(cell);
+                    if (self.hasPropHook(obj.class_name, pname, .get) and !self.inPropHook(obj, pname)) {
+                        self.setReturnRef(null);
+                        existing = (self.callPropHook(obj, pname, .get, .null) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        }) orelse .null;
+                        if (try self.propGetReturnsRef(obj, pname)) {
+                            hook_cell = try self.takeHookReturnCell();
+                            if (hook_cell) |cell| existing = cell.*;
+                        }
+                        if (existing != .object and !try self.propGetReturnsRef(obj, pname)) {
+                            const msg = try std.fmt.allocPrint(self.allocator, "Indirect modification of {s}::${s} is not allowed", .{ obj.class_name, pname });
+                            try self.strings.append(self.allocator, msg);
+                            if (try self.throwBuiltinException("Error", msg)) continue;
+                            return error.RuntimeError;
+                        }
+                    }
+                    if (existing != .object) {
+                        if (try self.checkPropertyMutation(obj, pname, .indirect)) continue;
+                    }
+                    if (hook_cell) |cell| existing = try self.prepareHookArray(cell);
                     if (existing == .string) {
                         const s = existing.string.bytes();
                         var idx: i64 = switch (ik) {
@@ -4387,7 +4604,11 @@ pub const VM = struct {
                         if (new_len > s.len) @memset(buf[s.len..], ' ');
                         buf[target_idx] = write_byte;
                         try self.strings.append(self.allocator, buf);
-                        try self.objectSetOwned(obj, pname, .{ .string = Value.String.borrowed(buf) });
+                        if (hook_cell) |cell| {
+                            const result = Value{ .string = Value.String.borrowed(buf) };
+                            self.setCell(cell, result);
+                            try self.propagateCellWrite(cell, result);
+                        } else try self.objectSetOwned(obj, pname, .{ .string = Value.String.borrowed(buf) });
                         self.push(v);
                         continue;
                     }
@@ -4398,7 +4619,7 @@ pub const VM = struct {
                         var ea = existing;
                         // a referenced property (`$r=&$obj->prop`) is shared on
                         // purpose - mutate in place, never separate a copy
-                        const inner = if (self.propIsReferenced(obj, pname)) existing.array else try self.cowSeparate(existing.array);
+                        const inner = if (hook_cell != null or self.propIsReferenced(obj, pname)) existing.array else try self.cowSeparate(existing.array);
                         if (inner != existing.array) {
                             try obj.set(self.allocator, pname, .{ .array = inner });
                             inner.refcount -= 1;
@@ -4415,7 +4636,10 @@ pub const VM = struct {
                         new_arr.* = .{};
                         try self.arrays.append(self.allocator, new_arr);
                         try new_arr.set(self.allocator, ik, v);
-                        try obj.set(self.allocator, pname, .{ .array = new_arr });
+                        if (hook_cell) |cell| {
+                            self.setCell(cell, .{ .array = new_arr });
+                            try self.propagateCellWrite(cell, cell.*);
+                        } else try obj.set(self.allocator, pname, .{ .array = new_arr });
                         self.push(v);
                         continue;
                     }
@@ -4458,6 +4682,10 @@ pub const VM = struct {
                         };
                         base_is_array_access_obj = true;
                     } else if (base == .object and outer_key == .string) {
+                        self.triggerLazyProperty(base.object, outer_key.string.bytes(), self.currentDefiningClass()) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
                         existing = base.object.get(outer_key.string.bytes());
                     } else {
                         self.push(v);
@@ -4691,20 +4919,8 @@ pub const VM = struct {
                         @memcpy(buf[0..s.len], s);
                         if (new_len > s.len) @memset(buf[s.len..], ' ');
                         buf[target_idx] = write_byte;
-                        try self.strings.append(self.allocator, buf);
-                        const new_str = Value{ .string = Value.String.borrowed(buf) };
-
-                        if (ref_cell) |cell| self.setCell(cell, new_str);
-                        if (frame.func) |func| {
-                            if (slot < func.slot_names.len) {
-                                const name = func.slot_names[slot];
-                                if (name.len > 0) try frame.vars.put(self.allocator, name, new_str);
-                            }
-                            if (slot < frame.locals.len) frame.locals[slot] = new_str;
-                        } else {
-                            if (slot < frame.locals.len) frame.locals[slot] = new_str;
-                            try self.setLocalGlobal(slot, new_str, frame);
-                        }
+                        const new_str = Value{ .string = try Value.String.adopt(self.allocator, buf) };
+                        try self.setVariableByName(frame, self.slotName(frame, slot), new_str);
                         self.push(val);
                         continue;
                     }
@@ -4918,20 +5134,54 @@ pub const VM = struct {
                     self.push(new_val);
                 },
 
-                .ensure_array_prop => {
+                .ensure_array_prop, .ensure_array_prop_dynamic => {
                     // load an object's property array for in-place write
                     // ($obj->prop[]=x, $obj->prop[k] op= v). COW-separate it
                     // from co-holders and write the unshared array back to the
                     // property; vivify null/false to a fresh array
-                    const name_idx = self.readU16();
-                    const prop_name = self.currentChunk().constants.items[name_idx].string.bytes();
+                    const prop_name = if (op == .ensure_array_prop_dynamic) try self.valueToString(self.pop()) else blk: {
+                        const name_idx = self.readU16();
+                        break :blk self.currentChunk().constants.items[name_idx].string.bytes();
+                    };
                     const obj_val = self.pop();
                     if (obj_val != .object) {
                         self.push(.null);
                         continue;
                     }
-                    const eap_obj = obj_val.object;
-                    const cur = eap_obj.get(prop_name);
+                    var eap_obj = obj_val.object;
+                    // Hook reads must precede vivification/COW. A by-value hook
+                    // may expose an object for offsetSet, but not writable array storage.
+                    eap_obj.refcount +%= 1;
+                    defer self.releaseValue(obj_val);
+                    self.triggerLazyProperty(eap_obj, prop_name, self.currentDefiningClass()) catch {
+                        if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                        return error.RuntimeError;
+                    };
+                    eap_obj = eap_obj.storage();
+                    var cur = eap_obj.get(prop_name);
+                    var hook_cell: ?*Value = null;
+                    defer if (hook_cell) |cell| self.unbindCell(cell);
+                    if (self.hasPropHook(eap_obj.class_name, prop_name, .get) and !self.inPropHook(eap_obj, prop_name)) {
+                        self.setReturnRef(null);
+                        cur = (self.callPropHook(eap_obj, prop_name, .get, .null) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        }) orelse .null;
+                        if (try self.propGetReturnsRef(eap_obj, prop_name)) {
+                            hook_cell = try self.takeHookReturnCell();
+                            if (hook_cell) |cell| cur = cell.*;
+                        }
+                        if (cur != .object and !try self.propGetReturnsRef(eap_obj, prop_name)) {
+                            const msg = try std.fmt.allocPrint(self.allocator, "Indirect modification of {s}::${s} is not allowed", .{ eap_obj.class_name, prop_name });
+                            try self.strings.append(self.allocator, msg);
+                            if (try self.throwBuiltinException("Error", msg)) continue;
+                            return error.RuntimeError;
+                        }
+                    }
+                    if (cur != .object) {
+                        if (try self.checkPropertyMutation(eap_obj, prop_name, .indirect)) continue;
+                    }
+                    if (hook_cell) |cell| cur = try self.prepareHookArray(cell);
                     if (cur == .int or cur == .float or (cur == .bool and cur.bool)) {
                         if (try self.throwBuiltinException("Error", "Cannot use a scalar value as an array")) continue;
                         return error.RuntimeError;
@@ -4939,7 +5189,7 @@ pub const VM = struct {
                     if (cur == .array) {
                         // a referenced property (`$r=&$obj->prop`) is shared on
                         // purpose - write through it in place, never separate
-                        if (self.propIsReferenced(eap_obj, prop_name)) {
+                        if (hook_cell != null or self.propIsReferenced(eap_obj, prop_name)) {
                             self.push(cur);
                             continue;
                         }
@@ -4971,7 +5221,10 @@ pub const VM = struct {
                     new_arr.* = .{};
                     try self.arrays.append(self.allocator, new_arr);
                     // obj.set retains -> refcount 1 (the property slot owns it)
-                    try eap_obj.set(self.allocator, prop_name, .{ .array = new_arr });
+                    if (hook_cell) |cell| {
+                        self.setCell(cell, .{ .array = new_arr });
+                        try self.propagateCellWrite(cell, cell.*);
+                    } else try eap_obj.set(self.allocator, prop_name, .{ .array = new_arr });
                     self.push(.{ .array = new_arr });
                 },
 
@@ -5087,6 +5340,7 @@ pub const VM = struct {
                             // alias the original's shared cell (entry.value already
                             // mirrors the referenced value)
                             entry.ref = null;
+                            if (entry.key == .string) entry.key.string.retain();
                             retainValue(entry.value);
                         }
                         copy.next_int_key = src.next_int_key;
@@ -5151,7 +5405,12 @@ pub const VM = struct {
                         } else if (iterable == .array) {
                             self.push(.{ .int = 0 });
                         } else if (iterable == .object) {
-                            const obj = iterable.object;
+                            var obj = iterable.object;
+                            self.triggerLazyInit(obj) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
+                            obj = obj.storage();
                             const arr = try self.allocator.create(PhpArray);
                             arr.* = .{};
                             try self.arrays.append(self.allocator, arr);
@@ -5312,6 +5571,14 @@ pub const VM = struct {
                             .string => |s| .{ .string = s },
                             else => .{ .int = Value.toInt(key_val) },
                         };
+                        // An element already referenced by a closure/variable
+                        // denotes that same cell; rebinding must not sever it.
+                        if (arr_ptr.getPtr(key)) |entry| {
+                            if (entry.ref) |cell| {
+                                try self.bindRefSlot(&self.currentFrame().ref_slots, name, cell);
+                                continue;
+                            }
+                        }
                         const cell = try self.newRefCell();
                         var elem = arr_ptr.get(key);
                         // `$v = &$arr[$k]` makes $arr[$k] a reference, which can't
@@ -5390,11 +5657,7 @@ pub const VM = struct {
                     const cell = try self.getOrCreateVarCell(frame, var_name);
                     if (arr_val == .array) {
                         const arr_ptr = arr_val.array;
-                        const key: PhpArray.Key = switch (key_val) {
-                            .int => |i| .{ .int = i },
-                            .string => |s| .{ .string = s },
-                            else => .{ .int = Value.toInt(key_val) },
-                        };
+                        const key = PhpArray.normalizeKey(Value.toArrayKey(key_val));
                         // The element becomes a mirror of the cell.
                         try self.arraySetOwned(arr_ptr, key, cell.*);
                         if (arr_ptr.getPtr(key)) |ep| self.setEntryRef(ep, cell);
@@ -5438,6 +5701,7 @@ pub const VM = struct {
                     const src_name = self.currentChunk().constants.items[src_idx].string.bytes();
                     const frame = self.currentFrame();
                     const cell = try self.getOrCreateVarCell(frame, src_name);
+                    if (cell.* == .array) _ = try self.separateReferencedArray(frame, src_name, cell, cell.array);
                     if (isSuperglobal(dst_name)) {
                         try self.bindRefSlot(&self.globals_cells, dst_name, cell);
                         try self.putRequestVar(dst_name, cell.*);
@@ -5489,6 +5753,12 @@ pub const VM = struct {
                             else => .{ .int = Value.toInt(key_val) },
                         };
                         if (append_ref) try self.arraySetOwned(arr_ptr, key, .null);
+                        if (arr_ptr.getPtr(key)) |entry| {
+                            if (entry.ref) |cell| {
+                                try self.bindRefSlot(&frame.ref_slots, dst_name, cell);
+                                continue;
+                            }
+                        }
                         const cell = try self.newRefCell();
                         var elem = arr_ptr.get(key);
                         // `$v = &$arr[$k]` makes $arr[$k] a reference - it can't
@@ -5524,6 +5794,12 @@ pub const VM = struct {
                     const source_name = self.currentChunk().constants.items[source_idx].string.bytes();
                     const obj_val = self.pop();
                     if (obj_val == .object) {
+                        if (!self.inPropHook(obj_val.object, prop_name) and
+                            (self.hasPropHook(obj_val.object.class_name, prop_name, .get) or self.hasPropHook(obj_val.object.class_name, prop_name, .set)))
+                        {
+                            if (try self.throwBuiltinException("Error", "Cannot assign by reference to overloaded object")) continue;
+                            return error.RuntimeError;
+                        }
                         const frame = self.currentFrame();
                         const cell = try self.getOrCreateVarCell(frame, source_name);
                         try self.objectSetOwned(obj_val.object, prop_name, cell.*);
@@ -5545,11 +5821,39 @@ pub const VM = struct {
 
                         try self.bindRefSlot(&frame.ref_slots, dst_name, c);
                     } else {
-                        const obj_ptr = obj_val.object;
+                        var obj_ptr = obj_val.object;
+                        self.triggerLazyProperty(obj_ptr, prop_name, self.currentDefiningClass()) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        obj_ptr = obj_ptr.storage();
+                        if (try self.checkPropertyMutation(obj_ptr, prop_name, .indirect)) continue;
+                        if (self.hasPropHook(obj_ptr.class_name, prop_name, .get) and !self.inPropHook(obj_ptr, prop_name) and !try self.propGetReturnsRef(obj_ptr, prop_name)) {
+                            obj_ptr.refcount +%= 1;
+                            defer self.releaseValue(.{ .object = obj_ptr });
+                            _ = self.callPropHook(obj_ptr, prop_name, .get, .null) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
+                            const msg = try std.fmt.allocPrint(self.allocator, "Indirect modification of {s}::${s} is not allowed", .{ obj_ptr.class_name, prop_name });
+                            try self.strings.append(self.allocator, msg);
+                            if (try self.throwBuiltinException("Error", msg)) continue;
+                            return error.RuntimeError;
+                        }
                         const has_prop = obj_ptr.properties.contains(prop_name) or (obj_ptr.slots != null and obj_ptr.getSlotIndex(prop_name) != null);
-                        if (!has_prop and self.hasMethod(obj_ptr.class_name, "__get")) {
+                        const ref_hook = self.hasPropHook(obj_ptr.class_name, prop_name, .get) and !self.inPropHook(obj_ptr, prop_name);
+                        if (ref_hook or (!has_prop and self.hasMethod(obj_ptr.class_name, "__get"))) {
+                            obj_ptr.refcount +%= 1;
+                            defer self.releaseValue(.{ .object = obj_ptr });
                             self.setReturnRef(null);
-                            _ = try self.callMagicGet(obj_ptr, prop_name);
+                            if (ref_hook) {
+                                _ = self.callPropHook(obj_ptr, prop_name, .get, .null) catch {
+                                    if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                    return error.RuntimeError;
+                                };
+                            } else {
+                                _ = try self.callMagicGet(obj_ptr, prop_name);
+                            }
                             if (self.last_return_ref) |cell| {
                                 try self.bindRefSlot(&frame.ref_slots, dst_name, cell);
                                 const owner = try self.ensureRefOwner(frame);
@@ -5563,8 +5867,21 @@ pub const VM = struct {
                                 continue;
                             }
                         }
-                        const cell = try self.newRefCell();
-                        self.setCell(cell, obj_ptr.get(prop_name));
+                        const cell = blk: {
+                            if (self.ref_index) |ri| {
+                                if (ri.prop_rev.get(.{ .object = obj_ptr, .class_name = "", .prop_name = prop_name })) |cells| {
+                                    if (cells.items.len > 0) break :blk cells.items[0];
+                                }
+                            }
+                            const fresh = try self.newRefCell();
+                            var value = obj_ptr.get(prop_name);
+                            if (value == .array and value.array.refcount > 1) {
+                                value = .{ .array = try self.shallowCloneCow(value.array) };
+                                try self.objectSetOwned(obj_ptr, prop_name, value);
+                            }
+                            self.setCell(fresh, value);
+                            break :blk fresh;
+                        };
 
                         try self.bindRefSlot(&frame.ref_slots, dst_name, cell);
                         try self.regRefObject(try self.ensureRefOwner(frame), cell, obj_ptr, prop_name);
@@ -5584,15 +5901,43 @@ pub const VM = struct {
 
                         try self.bindRefSlot(&frame.ref_slots, dst_name, c);
                     } else {
-                        const obj_ptr = obj_val.object;
+                        var obj_ptr = obj_val.object;
                         const prop_str = (try self.coerceToStringValue(name_val)).string.bytes();
                         // dupe so the binding's prop_name outlives the temporary
                         const prop_owned = try self.allocator.dupe(u8, prop_str);
                         try self.strings.append(self.allocator, prop_owned);
+                        self.triggerLazyProperty(obj_ptr, prop_owned, self.currentDefiningClass()) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        obj_ptr = obj_ptr.storage();
+                        if (try self.checkPropertyMutation(obj_ptr, prop_owned, .indirect)) continue;
+                        if (self.hasPropHook(obj_ptr.class_name, prop_owned, .get) and !self.inPropHook(obj_ptr, prop_owned) and !try self.propGetReturnsRef(obj_ptr, prop_owned)) {
+                            obj_ptr.refcount +%= 1;
+                            defer self.releaseValue(.{ .object = obj_ptr });
+                            _ = self.callPropHook(obj_ptr, prop_owned, .get, .null) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
+                            const msg = try std.fmt.allocPrint(self.allocator, "Indirect modification of {s}::${s} is not allowed", .{ obj_ptr.class_name, prop_owned });
+                            try self.strings.append(self.allocator, msg);
+                            if (try self.throwBuiltinException("Error", msg)) continue;
+                            return error.RuntimeError;
+                        }
                         const has_prop = obj_ptr.properties.contains(prop_owned) or (obj_ptr.slots != null and obj_ptr.getSlotIndex(prop_owned) != null);
-                        if (!has_prop and self.hasMethod(obj_ptr.class_name, "__get")) {
+                        const ref_hook = self.hasPropHook(obj_ptr.class_name, prop_owned, .get) and !self.inPropHook(obj_ptr, prop_owned);
+                        if (ref_hook or (!has_prop and self.hasMethod(obj_ptr.class_name, "__get"))) {
+                            obj_ptr.refcount +%= 1;
+                            defer self.releaseValue(.{ .object = obj_ptr });
                             self.setReturnRef(null);
-                            _ = try self.callMagicGet(obj_ptr, prop_owned);
+                            if (ref_hook) {
+                                _ = self.callPropHook(obj_ptr, prop_owned, .get, .null) catch {
+                                    if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                    return error.RuntimeError;
+                                };
+                            } else {
+                                _ = try self.callMagicGet(obj_ptr, prop_owned);
+                            }
                             if (self.last_return_ref) |cell| {
                                 try self.bindRefSlot(&frame.ref_slots, dst_name, cell);
                                 const owner = try self.ensureRefOwner(frame);
@@ -5606,8 +5951,21 @@ pub const VM = struct {
                                 continue;
                             }
                         }
-                        const cell = try self.newRefCell();
-                        self.setCell(cell, obj_ptr.get(prop_owned));
+                        const cell = blk: {
+                            if (self.ref_index) |ri| {
+                                if (ri.prop_rev.get(.{ .object = obj_ptr, .class_name = "", .prop_name = prop_owned })) |cells| {
+                                    if (cells.items.len > 0) break :blk cells.items[0];
+                                }
+                            }
+                            const fresh = try self.newRefCell();
+                            var value = obj_ptr.get(prop_owned);
+                            if (value == .array and value.array.refcount > 1) {
+                                value = .{ .array = try self.shallowCloneCow(value.array) };
+                                try self.objectSetOwned(obj_ptr, prop_owned, value);
+                            }
+                            self.setCell(fresh, value);
+                            break :blk fresh;
+                        };
 
                         try self.bindRefSlot(&frame.ref_slots, dst_name, cell);
                         try self.regRefObject(try self.ensureRefOwner(frame), cell, obj_ptr, prop_owned);
@@ -5628,7 +5986,7 @@ pub const VM = struct {
                             ri.releaseOwner(self.allocator, self.last_return_ref_owner);
                             self.last_return_ref_owner = 0;
                         }
-                        try frame.vars.put(self.allocator, dst_name, cell.*);
+                        if (dst_name.len == 0 or dst_name[0] != 0) try frame.vars.put(self.allocator, dst_name, cell.*);
                         if (frame.func) |func| {
                             for (func.slot_names, 0..) |sn, si| {
                                 if (std.mem.eql(u8, sn, dst_name)) {
@@ -5641,7 +5999,11 @@ pub const VM = struct {
                     } else {
                         // callee didn't return a ref - degrade to value copy
                         const val = self.peek();
-                        try frame.vars.put(self.allocator, dst_name, val);
+                        if (dst_name.len > 0 and dst_name[0] == 0) {
+                            const cell = try self.newRefCell();
+                            self.setCell(cell, val);
+                            try self.bindRefSlot(&frame.ref_slots, dst_name, cell);
+                        } else try frame.vars.put(self.allocator, dst_name, val);
                     }
                     // statement-level trailing .pop expects exactly one
                     // value on the stack from the assignment expression
@@ -5661,8 +6023,33 @@ pub const VM = struct {
                     const prop_name = self.currentChunk().constants.items[prop_idx].string.bytes();
                     const frame = self.currentFrame();
                     self.unbindRefSlot(&frame.ref_slots, dst_name);
-                    const cell = try self.newRefCell();
-                    self.setCell(cell, self.getStaticProp(class_name, prop_name) orelse .null);
+                    const cell = blk: {
+                        if (self.ref_index) |ri| {
+                            if (ri.prop_rev.get(.{ .object = null, .class_name = class_name, .prop_name = prop_name })) |cells| {
+                                if (cells.items.len > 0) {
+                                    const existing = cells.items[0];
+                                    if (existing.* == .array and existing.array.refcount > 1) {
+                                        const separated: Value = .{ .array = try self.shallowCloneCow(existing.array) };
+                                        self.setCell(existing, separated);
+                                        try self.propagateCellWrite(existing, separated);
+                                    }
+                                    break :blk existing;
+                                }
+                            }
+                        }
+                        var value = self.getStaticProp(class_name, prop_name) orelse .null;
+                        if (value == .array and value.array.refcount > 1) {
+                            value = .{ .array = try self.shallowCloneCow(value.array) };
+                            if (self.getStaticPropPtr(class_name, prop_name)) |slot| {
+                                VM.retainValue(value);
+                                self.releaseValue(slot.*);
+                                slot.* = value;
+                            }
+                        }
+                        const fresh = try self.newRefCell();
+                        self.setCell(fresh, value);
+                        break :blk fresh;
+                    };
 
                     try self.bindRefSlot(&frame.ref_slots, dst_name, cell);
                     try self.regRefStatic(try self.ensureRefOwner(frame), cell, class_name, prop_name);
@@ -5745,7 +6132,15 @@ pub const VM = struct {
                     const prop_name = self.currentChunk().constants.items[name_idx].string.bytes();
                     const obj_val = self.pop();
                     if (obj_val == .object) {
-                        const obj = obj_val.object;
+                        var obj = obj_val.object;
+                        self.triggerLazyProperty(obj, prop_name, self.currentDefiningClass()) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        obj = obj.storage();
+                        if (!obj.isUnset(prop_name)) {
+                            if (try self.checkPropertyMutation(obj, prop_name, .unset)) continue;
+                        }
                         {
                             const vr = self.findPropertyVisibility(obj.class_name, prop_name);
                             if (vr.is_readonly and obj.get(prop_name) != .null) {
@@ -5755,7 +6150,7 @@ pub const VM = struct {
                                 return error.RuntimeError;
                             }
                         }
-                        if (self.hasMethod(obj.class_name, "__unset")) {
+                        if (self.shouldCallMagicUnset(obj, prop_name)) {
                             _ = self.callMethod(obj, "__unset", &.{.{ .string = Value.String.borrowed(prop_name) }}) catch {};
                         } else {
                             // mark the property as unset so subsequent reads
@@ -5781,8 +6176,16 @@ pub const VM = struct {
                     const name_val = self.pop();
                     const obj_val = self.pop();
                     if (obj_val == .object and name_val == .string) {
-                        const obj = obj_val.object;
+                        var obj = obj_val.object;
+                        self.triggerLazyProperty(obj, name_val.string.bytes(), self.currentDefiningClass()) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        obj = obj.storage();
                         const prop_name = name_val.string.bytes();
+                        if (!obj.isUnset(prop_name)) {
+                            if (try self.checkPropertyMutation(obj, prop_name, .unset)) continue;
+                        }
                         const vr = self.findPropertyVisibility(obj.class_name, prop_name);
                         if (vr.is_readonly and obj.get(prop_name) != .null) {
                             const msg = try std.fmt.allocPrint(self.allocator, "Cannot unset readonly property {s}::${s}", .{ obj.class_name, prop_name });
@@ -5790,7 +6193,7 @@ pub const VM = struct {
                             if (try self.throwBuiltinException("Error", msg)) continue;
                             return error.RuntimeError;
                         }
-                        if (self.hasMethod(obj.class_name, "__unset")) {
+                        if (self.shouldCallMagicUnset(obj, prop_name)) {
                             _ = self.callMethod(obj, "__unset", &.{.{ .string = Value.String.borrowed(prop_name) }}) catch {};
                         } else {
                             try obj.markUnset(self.allocator, prop_name);
@@ -5808,6 +6211,18 @@ pub const VM = struct {
                     }
                     if (self.hasPendingReleases()) self.drainPendingDestruct();
                 },
+                .check_prop_dimension => {
+                    const obj_val = self.stack[self.sp - 2];
+                    const name = try self.valueToString(self.stack[self.sp - 1]);
+                    if (obj_val == .object) {
+                        const vr = self.findPropertyVisibility(obj_val.object.class_name, name);
+                        const cur = obj_val.object.getForScope(name, if (vr.visibility == .private) vr.defining_class else null);
+                        if (cur != .object) {
+                            if (try self.checkPropertyMutationVis(obj_val.object, name, .indirect, vr)) continue;
+                        }
+                    }
+                },
+
                 .unset_array_elem => {
                     const key = self.pop();
                     const arr_val = self.pop();
@@ -5838,119 +6253,42 @@ pub const VM = struct {
                     if (append_val == .array) self.emitWarning("Array to string conversion");
                     const is_ref = self.currentFrame().ref_slots.get(name);
 
-                    // find the local slot for this variable
-                    const ca_sn = if (self.currentFrame().func) |func| func.slot_names else self.currentFrame().slot_names;
-                    var ca_slot: u16 = 0xFFFF;
-                    for (ca_sn, 0..) |sn, si| {
-                        if (std.mem.eql(u8, sn, name)) {
-                            ca_slot = @intCast(si);
-                            break;
-                        }
-                    }
-
-                    // try growable buffer path for local variables (no refs)
-                    if (ca_slot != 0xFFFF and is_ref == null and self.ic != null and self.currentFrame().include_parent == null) {
-                        const ic = self.ic.?;
-                        const current = if (ca_slot < self.currentFrame().locals.len) self.currentFrame().locals[ca_slot] else Value.null;
-
-                        // check if we can reuse the existing buffer
-                        if (ic.concat_slot == ca_slot and ic.concat_frame == self.frame_count and ic.concat_buf.items.len > 0) {
-                            // verify the local still points into our buffer
-                            if (current == .string and current.string.len > 0 and
-                                ic.concat_buf.items.len >= current.string.len and
-                                current.string.ptr == ic.concat_buf.items.ptr)
-                            {
-                                if (append_val == .string) {
-                                    try ic.concat_buf.appendSlice(self.allocator, append_val.string.bytes());
-                                } else {
-                                    try append_val.format(&ic.concat_buf, self.allocator);
+                    const frame = self.currentFrame();
+                    const current = if (is_ref) |cell| cell.* else (frame.vars.get(name) orelse .null);
+                    var suffix_allocator = std.heap.stackFallback(128, self.allocator);
+                    const temporary_allocator = suffix_allocator.get();
+                    var suffix: std.ArrayListUnmanaged(u8) = .{};
+                    defer suffix.deinit(temporary_allocator);
+                    if (append_val == .string) {
+                        try suffix.appendSlice(temporary_allocator, append_val.string.bytes());
+                    } else try append_val.format(&suffix, temporary_allocator);
+                    if (is_ref == null and current == .string) {
+                        if (current.string.owner) |owner| {
+                            if (!owner.closure and owner.refcount == 1 and current.string.ptr == owner.bytes.ptr) {
+                                const length = std.math.add(usize, current.string.len, suffix.items.len) catch return error.OutOfMemory;
+                                if (length > owner.bytes.len) {
+                                    const growth = std.math.add(usize, owner.bytes.len / 2, 16) catch return error.OutOfMemory;
+                                    const capacity = @max(length, std.math.add(usize, owner.bytes.len, growth) catch length);
+                                    owner.bytes = try owner.allocator.realloc(owner.bytes, capacity);
                                 }
-                                const result_val = Value{ .string = Value.String.borrowed(ic.concat_buf.items) };
-                                self.currentFrame().locals[ca_slot] = result_val;
-                                try self.currentFrame().vars.put(self.allocator, name, result_val);
-                                self.push(result_val);
+                                @memcpy(owner.bytes[current.string.len..length], suffix.items);
+                                const result: Value = .{ .string = .{ .ptr = owner.bytes.ptr, .len = length, .owner = owner } };
+                                VM.retainValue(result);
+                                try self.setVariableByName(frame, name, result);
+                                self.push(result);
                                 continue;
                             }
                         }
-
-                        // finalize old buffer: transfer ownership to self.strings so
-                        // external references (array entries etc.) remain valid, then
-                        // start a fresh buffer
-                        if (ic.concat_buf.items.len > 0 and ic.concat_slot != 0xFFFF) {
-                            const old_str = try self.allocator.alloc(u8, ic.concat_buf.items.len);
-                            @memcpy(old_str, ic.concat_buf.items);
-                            try self.strings.append(self.allocator, old_str);
-                            if (ic.concat_frame == self.frame_count and ic.concat_slot < self.currentFrame().locals.len) {
-                                const old_val = self.currentFrame().locals[ic.concat_slot];
-                                if (old_val == .string and old_val.string.ptr == ic.concat_buf.items.ptr) {
-                                    self.currentFrame().locals[ic.concat_slot] = .{ .string = Value.String.borrowed(old_str) };
-                                }
-                            }
-                            // preserve old buffer memory for external references
-                            if (ic.concat_buf.capacity > 0) {
-                                try self.strings.append(self.allocator, ic.concat_buf.allocatedSlice());
-                                ic.concat_buf = .{};
-                            }
-                        } else {
-                            ic.concat_buf.clearRetainingCapacity();
-                        }
-                        if (current == .string) {
-                            try ic.concat_buf.appendSlice(self.allocator, current.string.bytes());
-                        } else if (current != .null) {
-                            try current.format(&ic.concat_buf, self.allocator);
-                        }
-                        if (append_val == .string) {
-                            try ic.concat_buf.appendSlice(self.allocator, append_val.string.bytes());
-                        } else {
-                            try append_val.format(&ic.concat_buf, self.allocator);
-                        }
-                        ic.concat_slot = ca_slot;
-                        ic.concat_frame = self.frame_count;
-                        const result_val = Value{ .string = Value.String.borrowed(ic.concat_buf.items) };
-                        self.currentFrame().locals[ca_slot] = result_val;
-                        try self.currentFrame().vars.put(self.allocator, name, result_val);
-                        self.push(result_val);
-                        continue;
                     }
-
-                    // fallback: allocate new string each time (ref variables, no IC, no slot)
-                    const current = if (is_ref) |cell| cell.* else (self.currentFrame().vars.get(name) orelse .null);
-                    var result_str: []const u8 = undefined;
-                    if (current == .string and append_val == .string) {
-                        const cs = current.string.bytes();
-                        const as = append_val.string.bytes();
-                        const new_str = try self.allocator.alloc(u8, cs.len + as.len);
-                        @memcpy(new_str[0..cs.len], cs);
-                        @memcpy(new_str[cs.len..], as);
-                        try self.strings.append(self.allocator, new_str);
-                        result_str = new_str;
-                    } else {
-                        var buf = std.ArrayListUnmanaged(u8){};
-                        if (current == .string) {
-                            try buf.appendSlice(self.allocator, current.string.bytes());
-                        } else {
-                            try current.format(&buf, self.allocator);
-                        }
-                        if (append_val == .string) {
-                            try buf.appendSlice(self.allocator, append_val.string.bytes());
-                        } else {
-                            try append_val.format(&buf, self.allocator);
-                        }
-                        const owned = try buf.toOwnedSlice(self.allocator);
-                        try self.strings.append(self.allocator, owned);
-                        result_str = owned;
-                    }
-                    const result_val = Value{ .string = Value.String.borrowed(result_str) };
-                    if (is_ref) |cell| {
-                        self.setCell(cell, result_val);
-                        try self.propagateCellWrite(cell, result_val);
-                    }
-                    try self.currentFrame().vars.put(self.allocator, name, result_val);
-                    if (ca_slot != 0xFFFF and ca_slot < self.currentFrame().locals.len) {
-                        self.currentFrame().locals[ca_slot] = result_val;
-                    }
-                    try self.syncIncludeVar(self.currentFrame(), name, result_val);
-                    self.push(result_val);
+                    var buffer: std.ArrayListUnmanaged(u8) = .{};
+                    errdefer buffer.deinit(self.stringAllocator());
+                    if (current == .string) {
+                        try buffer.appendSlice(self.stringAllocator(), current.string.bytes());
+                    } else if (current != .null) try current.format(&buffer, self.stringAllocator());
+                    try buffer.appendSlice(self.stringAllocator(), suffix.items);
+                    const result: Value = .{ .string = try Value.String.adopt(self.stringAllocator(), try buffer.toOwnedSlice(self.stringAllocator())) };
+                    try self.setVariableByName(frame, name, result);
+                    self.push(result);
                 },
                 .get_local => {
                     const slot = self.readU16();
@@ -6125,7 +6463,22 @@ pub const VM = struct {
                     const prop_name = self.currentChunk().constants.items[name_idx].string.bytes();
                     const obj_val = self.pop();
                     if (obj_val == .object) {
-                        const obj = obj_val.object;
+                        var obj = obj_val.object;
+                        self.triggerLazyProperty(obj, prop_name, self.currentDefiningClass()) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        obj = obj.storage();
+                        if (self.hasPropHook(obj.class_name, prop_name, .get) and !self.inPropHook(obj, prop_name)) {
+                            obj.refcount +%= 1;
+                            defer self.releaseValue(.{ .object = obj });
+                            const result = self.callPropHook(obj, prop_name, .get, .null) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
+                            self.push(.{ .bool = (result orelse .null) != .null });
+                            continue;
+                        }
                         if (obj.properties.contains(prop_name) or (obj.slots != null and obj.getSlotIndex(prop_name) != null)) {
                             self.push(.{ .bool = obj.get(prop_name) != .null });
                         } else if (self.hasMethod(obj.class_name, "__isset")) {
@@ -6142,8 +6495,23 @@ pub const VM = struct {
                     const prop_name_val = self.pop();
                     const obj_val = self.pop();
                     if (obj_val == .object and prop_name_val == .string) {
-                        const obj = obj_val.object;
+                        var obj = obj_val.object;
+                        self.triggerLazyProperty(obj, prop_name_val.string.bytes(), self.currentDefiningClass()) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        obj = obj.storage();
                         const prop_name = prop_name_val.string.bytes();
+                        if (self.hasPropHook(obj.class_name, prop_name, .get) and !self.inPropHook(obj, prop_name)) {
+                            obj.refcount +%= 1;
+                            defer self.releaseValue(.{ .object = obj });
+                            const result = self.callPropHook(obj, prop_name, .get, .null) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
+                            self.push(.{ .bool = (result orelse .null) != .null });
+                            continue;
+                        }
                         if (obj.properties.contains(prop_name) or (obj.slots != null and obj.getSlotIndex(prop_name) != null)) {
                             self.push(.{ .bool = obj.get(prop_name) != .null });
                         } else if (self.hasMethod(obj.class_name, "__isset")) {
@@ -6205,7 +6573,12 @@ pub const VM = struct {
                         return error.RuntimeError;
                     }
                     if (val == .object) {
-                        const src = val.object;
+                        var src = val.object;
+                        self.triggerLazyInit(src) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        src = src.storage();
                         const copy = try self.allocator.create(PhpObject);
                         self.next_object_id += 1;
                         copy.* = .{ .class_name = src.class_name, .id = self.next_object_id };
@@ -6222,13 +6595,37 @@ pub const VM = struct {
                             try copy.properties.put(self.allocator, entry.key_ptr.*, try self.copyObjectCloneValue(entry.value_ptr.*));
                         }
                         try self.objects.append(self.allocator, copy);
+                        if (src.ref_mirrored) {
+                            if (src.slot_layout) |layout| {
+                                for (layout.names) |name| {
+                                    if (self.ref_index) |ri| {
+                                        if (ri.prop_rev.get(.{ .object = src, .class_name = "", .prop_name = name })) |cells| {
+                                            if (cells.items.len > 0) {
+                                                const cell = cells.items[0];
+                                                try self.regRefObject(try self.persistentRefOwner(), cell, copy, name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if (self.hasMethod(src.class_name, "__clone")) {
                             _ = self.callMethod(copy, "__clone", &.{}) catch {
                                 if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
                                 return error.RuntimeError;
                             };
                         }
-                        self.push(.{ .object = copy });
+                        if (val.object.backingValue() != .null) {
+                            const proxy = try self.allocator.create(PhpObject);
+                            self.next_object_id += 1;
+                            proxy.* = .{ .class_name = val.object.class_name, .id = self.next_object_id, .slot_layout = val.object.slot_layout };
+                            const state = try self.allocator.create(PhpObject.LazyState);
+                            state.* = .{ .initializer = .null, .proxy = true, .pending = try self.allocator.alloc(bool, 0), .backing = copy };
+                            proxy.lazy = state;
+                            copy.retain();
+                            try self.objects.append(self.allocator, proxy);
+                            self.push(.{ .object = proxy });
+                        } else self.push(.{ .object = copy });
                     } else {
                         self.push(val);
                     }
@@ -6306,14 +6703,13 @@ pub const VM = struct {
                             if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
                             return error.RuntimeError;
                         };
-                        self.push(.{ .string = Value.String.borrowed(s) });
+                        self.pushTransfer(.{ .string = try Value.String.create(self.allocator, s) });
                     } else {
                         if (v == .array) self.emitWarning("Array to string conversion");
                         var buf = std.ArrayListUnmanaged(u8){};
+                        defer buf.deinit(self.allocator);
                         try v.format(&buf, self.allocator);
-                        const s = try buf.toOwnedSlice(self.allocator);
-                        try self.strings.append(self.allocator, s);
-                        self.push(.{ .string = Value.String.borrowed(s) });
+                        self.pushTransfer(.{ .string = try Value.String.create(self.allocator, buf.items) });
                     }
                 },
                 .cast_bool => {
@@ -6325,7 +6721,7 @@ pub const VM = struct {
                     if (v == .array) {
                         self.push(v);
                     } else if (v == .object) {
-                        const obj = v.object;
+                        const obj = v.object.storage();
                         const arr = try self.allocator.create(PhpArray);
                         arr.* = .{};
                         try self.arrays.append(self.allocator, arr);
@@ -6333,6 +6729,7 @@ pub const VM = struct {
                             if (obj.slot_layout) |layout| {
                                 for (layout.names, 0..) |name, i| {
                                     if (i < slots.len) {
+                                        if (obj.isLazySlot(name, layout.declaring_classes[i])) continue;
                                         const vr = self.findPropertyVisibility(obj.class_name, name);
                                         // PHP omits uninitialized typed properties and
                                         // explicitly-unset properties from (array) casts
@@ -6477,52 +6874,10 @@ pub const VM = struct {
                         .value = val,
                     });
                     const gop = try self.capture_index.getOrPut(self.allocator, closure_name);
-                    const first_bind = !gop.found_existing or gop.value_ptr.len == 0;
                     if (gop.found_existing) {
                         gop.value_ptr.len += 1;
                     } else {
                         gop.value_ptr.* = .{ .start = cap_pos, .len = 1, .has_refs = false };
-                    }
-                    // closures defined inside class methods inherit class scope
-                    const lexical_class = self.currentDefiningClass();
-                    if (std.mem.eql(u8, var_name, "$this") and val == .object) {
-                        // instance method closure: LSB = $this's runtime class
-                        try self.captures.append(self.allocator, .{
-                            .closure_name = closure_name,
-                            .var_name = "$__closure_scope",
-                            .value = .{ .string = Value.String.borrowed(val.object.class_name) },
-                        });
-                        const gop2 = try self.capture_index.getOrPut(self.allocator, closure_name);
-                        gop2.value_ptr.len += 1;
-                        if (lexical_class) |class_name| {
-                            try self.captures.append(self.allocator, .{
-                                .closure_name = closure_name,
-                                .var_name = "$__closure_defclass",
-                                .value = .{ .string = Value.String.borrowed(class_name) },
-                            });
-                            const gop3 = try self.capture_index.getOrPut(self.allocator, closure_name);
-                            gop3.value_ptr.len += 1;
-                        }
-                    } else if (first_bind) {
-                        const scope = self.currentFrame().called_class orelse lexical_class;
-                        if (scope) |class_name| {
-                            try self.captures.append(self.allocator, .{
-                                .closure_name = closure_name,
-                                .var_name = "$__closure_scope",
-                                .value = .{ .string = Value.String.borrowed(class_name) },
-                            });
-                            const gop2 = try self.capture_index.getOrPut(self.allocator, closure_name);
-                            gop2.value_ptr.len += 1;
-                        }
-                        if (lexical_class) |class_name| {
-                            try self.captures.append(self.allocator, .{
-                                .closure_name = closure_name,
-                                .var_name = "$__closure_defclass",
-                                .value = .{ .string = Value.String.borrowed(class_name) },
-                            });
-                            const gop2 = try self.capture_index.getOrPut(self.allocator, closure_name);
-                            gop2.value_ptr.len += 1;
-                        }
                     }
                 },
 
@@ -6599,6 +6954,8 @@ pub const VM = struct {
                         self.frame_count -= 1;
                         self.deinitFrameSlot(self.frame_count);
                     }
+
+                    self.discardArgTransport(handler.sp);
 
                     self.sp = handler.sp;
                     self.pushTransfer(exception);
@@ -6718,6 +7075,8 @@ pub const VM = struct {
                 .require => {
                     const variant = self.readByte();
                     const path_val = self.pop();
+                    VM.retainValue(path_val);
+                    defer self.releaseValue(path_val);
                     if (path_val != .string) {
                         self.push(.null);
                     } else {
@@ -6728,7 +7087,13 @@ pub const VM = struct {
                         if (is_once and self.loaded_files.contains(path)) {
                             self.push(.{ .bool = true });
                         } else {
-                            const from_cache = self.serve_mode and self.serve_compile_cache.contains(path);
+                            const stable_path = blk: {
+                                const owned = try self.allocator.dupe(u8, path);
+                                errdefer self.allocator.free(owned);
+                                try self.strings.append(self.allocator, owned);
+                                break :blk owned;
+                            };
+                            const from_cache = self.serve_mode and self.serve_compile_cache.contains(stable_path);
                             const result: ?*CompileResult = if (from_cache)
                                 self.serve_compile_cache.get(path).?
                             else if (self.file_loader) |loader|
@@ -6742,7 +7107,7 @@ pub const VM = struct {
                                     try self.serve_cache_keys.append(self.allocator, duped);
                                     try self.serve_compile_cache.put(self.allocator, duped, r);
                                 }
-                                try self.loaded_files.put(self.allocator, path, {});
+                                try self.loaded_files.put(self.allocator, stable_path, {});
                                 if (!from_cache) {
                                     try self.compile_results.append(self.allocator, r);
                                 }
@@ -6842,6 +7207,7 @@ pub const VM = struct {
                                                     self.frame_count -= 1;
                                                     self.deinitFrameSlot(self.frame_count);
                                                 }
+                                                self.discardArgTransport(handler.sp);
                                                 self.sp = handler.sp;
                                                 self.push(exc);
                                                 self.currentFrame().ip = handler.catch_ip;
@@ -7010,6 +7376,7 @@ pub const VM = struct {
                             try def.static_props.put(self.allocator, cname, try self.copyDefault(cval));
                             try def.constant_names.put(self.allocator, cname, {});
                         }
+                        self.clearArgStackFrom(self.sp - const_count);
                         self.sp -= const_count;
                     } else {
                         // read const names even when 0 (shouldn't have any)
@@ -7028,6 +7395,42 @@ pub const VM = struct {
                         const ma_name = self.currentChunk().constants.items[ma_name_idx].string.bytes();
                         const ma_attrs = try self.readAttributeDefs();
                         try def.method_attributes.put(self.allocator, ma_name, ma_attrs);
+                    }
+
+                    const property_count = self.readU16();
+                    for (0..property_count) |_| {
+                        const prop_name = self.currentChunk().constants.items[self.readU16()].string.bytes();
+                        const type_idx = self.readU16();
+                        const doc_idx = self.readU16();
+                        try def.properties.append(self.allocator, .{
+                            .name = prop_name,
+                            .default = .null,
+                            .is_virtual = true,
+                            .type_str = if (type_idx == 0xffff) "" else self.currentChunk().constants.items[type_idx].string.bytes(),
+                            .doc_comment = if (doc_idx == 0xffff) "" else self.currentChunk().constants.items[doc_idx].string.bytes(),
+                        });
+                        const mask = self.readByte();
+                        for (0..2) |i| {
+                            if (mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
+                            const hook = self.currentChunk().constants.items[self.readU16()].string.bytes();
+                            try idef.methods.append(self.allocator, hook);
+                            try def.methods.put(self.allocator, hook, .{ .name = hook, .arity = @intCast(i), .is_abstract = true });
+                        }
+                        const attrs = try self.readAttributeDefs();
+                        if (attrs.len > 0) try def.property_attributes.put(self.allocator, prop_name, attrs);
+                    }
+                    // Interfaces inherit contracts from every parent, including
+                    // diamonds. Keep local declarations authoritative.
+                    for (idef.parents.items) |parent| {
+                        if (!self.interfaces.contains(parent)) try self.tryAutoload(parent);
+                        if (self.classes.get(parent)) |base| {
+                            _ = base;
+                            if (self.interfaces.get(parent)) |parent_iface| {
+                                for (parent_iface.methods.items) |method| {
+                                    if (std.mem.indexOf(u8, method, "$hook_") != null) try idef.methods.append(self.allocator, method);
+                                }
+                            }
+                        }
                     }
 
                     if (self.classes.fetchRemove(iface_name)) |old| {
@@ -7060,11 +7463,13 @@ pub const VM = struct {
                         var tp_names: [32][]const u8 = undefined;
                         var tp_has_default: [32]u8 = undefined;
                         var tp_vis: [32]ClassDef.Visibility = undefined;
+                        var tp_flags: [32]u8 = undefined;
                         for (0..tp_count) |pi| {
                             tp_names[pi] = self.currentChunk().constants.items[self.readU16()].string.bytes();
                             tp_has_default[pi] = self.readByte();
                             const vis_byte = self.readByte();
                             tp_vis[pi] = @enumFromInt(vis_byte & 0x03);
+                            tp_flags[pi] = vis_byte;
                         }
                         const tp_defaults = self.popDefaults(32, tp_has_default[0..tp_count]);
                         const props = try self.allocator.alloc(ClassDef.PropertyDef, tp_count);
@@ -7077,7 +7482,27 @@ pub const VM = struct {
                             } else Value{ .null = {} };
                             // the trait definition owns its defaults (popDefaults released the stack's reference)
                             retainValue(dval);
-                            props[pi] = .{ .name = tp_names[pi], .default = dval, .visibility = tp_vis[pi] };
+                            // Ordinary trait properties have symmetric read/write visibility,
+                            // just like properties declared directly on a class. Leaving
+                            // set_visibility at its public default invents a wider parent
+                            // write contract when a child redeclares a protected property.
+                            const flags = tp_flags[pi];
+                            const has_set_visibility = (flags & 0x20) != 0;
+                            const set_visibility: ClassDef.Visibility = if (has_set_visibility)
+                                @enumFromInt((flags >> 3) & 0x03)
+                            else if ((flags & 0x04) != 0 and tp_vis[pi] == .public)
+                                .protected
+                            else
+                                tp_vis[pi];
+                            props[pi] = .{
+                                .name = tp_names[pi],
+                                .default = dval,
+                                .visibility = tp_vis[pi],
+                                .set_visibility = set_visibility,
+                                .has_set_visibility = has_set_visibility,
+                                .is_readonly = (flags & 0x04) != 0,
+                                .is_final = (flags & 0x80) != 0 or (has_set_visibility and set_visibility == .private),
+                            };
                         }
                         try self.trait_props.put(self.allocator, trait_name, props);
                     }
@@ -7168,6 +7593,8 @@ pub const VM = struct {
                 .enum_decl => try self.handleEnumDecl(),
 
                 .new_obj => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const name_idx = self.readU16();
                     var arg_count = self.readByte();
                     // 0xFF signals spread args: top of stack is an array to unpack
@@ -7205,6 +7632,8 @@ pub const VM = struct {
                                 if (ctor_name) |ctn| {
                                     if (self.functions.get(ctn)) |func| {
                                         var resolved: [256]Value = .{.null} ** 256;
+                                        var resolved_sources: [256]RefSource = undefined;
+                                        @memset(resolved_sources[0..@min(resolved_sources.len, func.params.len + entries.len)], .none);
                                         if (func.params.len > resolved.len) return error.RuntimeError;
                                         var pos: usize = 0;
                                         for (entries) |entry| {
@@ -7213,12 +7642,14 @@ pub const VM = struct {
                                                     const pname = if (p.len > 0 and p[0] == '$') p[1..] else p;
                                                     if (std.mem.eql(u8, pname, entry.key.string.bytes()) or std.mem.eql(u8, p, entry.key.string.bytes())) {
                                                         resolved[pi] = entry.value;
+                                                        resolved_sources[pi] = self.argArraySource(arr_val.array, entry.key);
                                                         if (pi >= pos) pos = pi + 1;
                                                         break;
                                                     }
                                                 }
                                             } else {
                                                 resolved[pos] = entry.value;
+                                                resolved_sources[pos] = self.argArraySource(arr_val.array, entry.key);
                                                 pos += 1;
                                             }
                                         }
@@ -7228,18 +7659,21 @@ pub const VM = struct {
                                                 resolved[i] = try self.resolveDefault(func.defaults[i]);
                                             }
                                         }
-                                        for (0..count) |i| self.push(resolved[i]);
+                                        for (0..count) |i| {
+                                            self.push(resolved[i]);
+                                            self.setArgSource(self.sp - 1, resolved_sources[i]);
+                                        }
                                         arg_count = @intCast(count);
                                     } else {
-                                        for (entries) |entry| self.push(entry.value);
+                                        for (entries) |entry| self.pushArgEntry(arr_val.array, entry);
                                         arg_count = @intCast(entries.len);
                                     }
                                 } else {
-                                    for (entries) |entry| self.push(entry.value);
+                                    for (entries) |entry| self.pushArgEntry(arr_val.array, entry);
                                     arg_count = @intCast(entries.len);
                                 }
                             } else {
-                                for (entries) |entry| self.push(entry.value);
+                                for (entries) |entry| self.pushArgEntry(arr_val.array, entry);
                                 arg_count = @intCast(entries.len);
                             }
                         } else {
@@ -7350,7 +7784,7 @@ pub const VM = struct {
 
                             const saved_fc = self.frame_count;
                             var ctx = self.makeContext(null);
-                            _ = self.invokeNative(native, &ctx, args_buf[0..ac], cn) catch {
+                            const ctor_result = self.invokeNative(native, &ctx, args_buf[0..ac], cn) catch {
                                 // clean up temp frame if throwBuiltinException didn't already unwind past it
                                 if (self.frame_count >= saved_fc) {
                                     self.frame_count -= 1;
@@ -7365,6 +7799,7 @@ pub const VM = struct {
                                             self.frame_count -= 1;
                                             self.deinitFrameSlot(self.frame_count);
                                         }
+                                        self.discardArgTransport(handler.sp);
                                         self.sp = handler.sp;
                                         self.push(exc);
                                         self.currentFrame().ip = handler.catch_ip;
@@ -7376,6 +7811,7 @@ pub const VM = struct {
                                 }
                                 return error.RuntimeError;
                             };
+                            if (ctor_result == .string) ctor_result.string.release();
 
                             self.frame_count -= 1;
                             self.deinitFrameSlot(self.frame_count);
@@ -7464,12 +7900,22 @@ pub const VM = struct {
                                         try new_vars.put(self.allocator, func.params[i], try self.bindFrameArg(self.stack[self.sp - ac + i]));
                                     }
                                 }
+                                var ctor_refs: std.StringHashMapUnmanaged(*Value) = .{};
+                                const ctor_owner = try self.argRefOwner(func);
+                                self.captureArgSources(ac);
+                                self.bindOwnedRefParams(ac, func, &new_vars, &ctor_refs, ctor_owner) catch |err| {
+                                    new_vars.deinit(self.allocator);
+                                    self.deinitRefSlots(&ctor_refs);
+                                    if (self.ref_index) |ri| ri.releaseOwner(self.allocator, ctor_owner);
+                                    if (self.dispatchPendingException(base_frame)) continue;
+                                    return err;
+                                };
                                 self.dropN(ac);
                                 if (!func.is_variadic and ac < func.arity) for (ac..func.arity) |i| {
                                     const default = if (i < func.defaults.len) try self.resolveDefault(func.defaults[i]) else Value.null;
                                     try new_vars.put(self.allocator, func.params[i], default);
                                 };
-                                self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func, .called_class = class_name };
+                                self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func, .called_class = class_name, .ref_slots = ctor_refs, .ref_owner = ctor_owner };
                                 self.frames[self.frame_count].entry_sp = self.sp;
                                 self.frame_count += 1;
                                 self.retainFrameObjects(self.frame_count - 1);
@@ -7490,13 +7936,15 @@ pub const VM = struct {
                 },
 
                 .new_obj_dynamic => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     var arg_count = self.readByte();
                     // 0xFF signals spread args: top of stack is an array to unpack
                     if (arg_count == 0xFF) {
                         const arr_val = self.pop();
                         if (arr_val == .array) {
                             const entries = arr_val.array.entries.items;
-                            for (entries) |entry| self.push(entry.value);
+                            for (entries) |entry| self.pushArgEntry(arr_val.array, entry);
                             arg_count = @intCast(entries.len);
                         } else {
                             arg_count = 0;
@@ -7550,7 +7998,7 @@ pub const VM = struct {
                             self.retainFrameObjects(self.frame_count - 1);
                             if (self.frame_count > self.frame_high_water) self.frame_high_water = self.frame_count;
                             var ctx = self.makeContext(null);
-                            _ = self.invokeNative(native, &ctx, args_buf[0..ac], cn) catch {
+                            const ctor_result = self.invokeNative(native, &ctx, args_buf[0..ac], cn) catch {
                                 self.frame_count -= 1;
                                 self.deinitFrameSlot(self.frame_count);
                                 if (self.pending_exception) |exc| {
@@ -7563,6 +8011,7 @@ pub const VM = struct {
                                             self.frame_count -= 1;
                                             self.deinitFrameSlot(self.frame_count);
                                         }
+                                        self.discardArgTransport(handler.sp);
                                         self.sp = handler.sp;
                                         self.push(exc);
                                         self.currentFrame().ip = handler.catch_ip;
@@ -7574,6 +8023,7 @@ pub const VM = struct {
                                 }
                                 return error.RuntimeError;
                             };
+                            if (ctor_result == .string) ctor_result.string.release();
                             self.frame_count -= 1;
                             self.deinitFrameSlot(self.frame_count);
                         } else if (self.functions.get(cn)) |func| {
@@ -7583,12 +8033,22 @@ pub const VM = struct {
                             for (0..@min(ac, func.arity)) |i| {
                                 try new_vars.put(self.allocator, func.params[i], try self.bindFrameArg(self.stack[self.sp - ac + i]));
                             }
+                            var ctor_refs: std.StringHashMapUnmanaged(*Value) = .{};
+                            const ctor_owner = try self.argRefOwner(func);
+                            self.captureArgSources(ac);
+                            self.bindOwnedRefParams(ac, func, &new_vars, &ctor_refs, ctor_owner) catch |err| {
+                                new_vars.deinit(self.allocator);
+                                self.deinitRefSlots(&ctor_refs);
+                                if (self.ref_index) |ri| ri.releaseOwner(self.allocator, ctor_owner);
+                                if (self.dispatchPendingException(base_frame)) continue;
+                                return err;
+                            };
                             self.dropN(ac + 1);
                             for (@min(ac, func.arity)..func.arity) |i| {
                                 const default = if (i < func.defaults.len) try self.resolveDefault(func.defaults[i]) else Value.null;
                                 try new_vars.put(self.allocator, func.params[i], default);
                             }
-                            self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func, .called_class = class_name };
+                            self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func, .called_class = class_name, .ref_slots = ctor_refs, .ref_owner = ctor_owner };
                             self.frames[self.frame_count].entry_sp = self.sp;
                             self.frame_count += 1;
                             self.retainFrameObjects(self.frame_count - 1);
@@ -7606,15 +8066,47 @@ pub const VM = struct {
                     self.push(.{ .object = obj });
                 },
 
-                .get_prop => {
-                    const gp_ip = self.currentFrame().ip;
+                .arg_variable => {
                     const name_idx = self.readU16();
-                    const prop_name = self.currentChunk().constants.items[name_idx].string.bytes();
+                    const field = self.currentFrame().ip;
+                    const delta = self.readU16();
+                    const pos = self.readByte();
+                    if (self.argNeedsCapture(self.currentChunk(), field, delta, pos, 1))
+                        self.setArgSource(self.sp - 1, .{ .simple = self.currentChunk().constants.items[name_idx].string.bytes() });
+                },
+                .arg_guard_prop, .arg_guard_prop_dynamic, .arg_guard_dim => {
+                    const field = self.currentFrame().ip;
+                    const delta = self.readU16();
+                    const pos = self.readByte();
+                    const operands: usize = if (op == .arg_guard_prop) 1 else 2;
+                    self.arg_capture_pending = self.argNeedsCapture(self.currentChunk(), field, delta, pos, operands);
+                },
+                .get_prop, .get_prop_dynamic => {
+                    const capturing = self.arg_capture_pending;
+                    self.arg_capture_pending = false;
+                    const gp_ip = self.currentFrame().ip;
+                    const prop_name = if (op == .get_prop_dynamic) try self.valueToString(self.pop()) else blk: {
+                        const name_idx = self.readU16();
+                        break :blk self.currentChunk().constants.items[name_idx].string.bytes();
+                    };
                     const obj_val = self.pop();
+                    const arg_sp = self.sp;
+                    defer if (capturing and self.hasPendingReleases()) self.drainPendingDestruct();
+                    if (capturing) stackRetain(obj_val);
+                    defer if (capturing) self.releaseValue(obj_val);
+                    defer if (capturing and obj_val == .object and self.sp == arg_sp + 1 and self.pending_exception == null) {
+                        self.capturePropertyCell(arg_sp, obj_val.object.storage(), prop_name) catch unreachable;
+                    };
                     if (obj_val == .object) {
-                        const obj = obj_val.object;
+                        var obj = obj_val.object;
+                        obj.refcount +%= 1;
+                        defer self.releaseValue(obj_val);
 
-                        if (obj.lazy_initializer != .null) try self.triggerLazyInit(obj);
+                        if (obj.isLazySlot(prop_name, self.currentDefiningClass())) self.triggerLazyInit(obj) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        obj = obj.storage();
 
                         // property hooks: dispatch to get hook if present (and not recursing).
                         // route exceptions through the local try/catch handler
@@ -7632,7 +8124,7 @@ pub const VM = struct {
                         // IC: slot-indexed fast path. skip the cache when the
                         // property was explicitly unset - the slot still holds
                         // a value, but we need to fall through to __get
-                        if (self.ic) |ic| {
+                        if (if (op == .get_prop) self.ic else null) |ic| {
                             const gp_idx = InlineCache.propIndex(@intFromPtr(self.currentChunk()), gp_ip);
                             const gp_entry = &ic.prop[gp_idx];
                             const gp_chunk_key = @intFromPtr(self.currentChunk());
@@ -7701,7 +8193,7 @@ pub const VM = struct {
                                 if (try self.throwBuiltinException("Error", msg)) continue;
                                 return error.RuntimeError;
                             }
-                            if (self.ic) |ic| {
+                            if (if (op == .get_prop) self.ic else null) |ic| {
                                 if (vr.visibility == .public) {
                                     const gp_idx = InlineCache.propIndex(@intFromPtr(self.currentChunk()), gp_ip);
                                     const si = if (obj.slot_layout != null) obj.getSlotIndex(prop_name) orelse @as(u16, 0xFFFF) else @as(u16, 0xFFFF);
@@ -7730,16 +8222,24 @@ pub const VM = struct {
                     }
                 },
 
-                .get_prop_coalesce => {
+                .get_prop_coalesce, .get_prop_coalesce_dynamic => {
                     // non-throwing property read for `??` / `??=`. an
                     // uninitialized typed property reads as a null slot value,
                     // which `??` then routes to the RHS - no error
-                    const name_idx = self.readU16();
-                    const prop_name = self.currentChunk().constants.items[name_idx].string.bytes();
+                    const prop_name = if (op == .get_prop_coalesce_dynamic) try self.valueToString(self.pop()) else blk: {
+                        const name_idx = self.readU16();
+                        break :blk self.currentChunk().constants.items[name_idx].string.bytes();
+                    };
                     const obj_val = self.pop();
                     if (obj_val == .object) {
-                        const obj = obj_val.object;
-                        if (obj.lazy_initializer != .null) try self.triggerLazyInit(obj);
+                        var obj = obj_val.object;
+                        obj.refcount +%= 1;
+                        defer self.releaseValue(obj_val);
+                        if (obj.isLazySlot(prop_name, self.currentDefiningClass())) self.triggerLazyInit(obj) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        obj = obj.storage();
                         if (self.hasPropHook(obj.class_name, prop_name, .get) and !self.inPropHook(obj, prop_name)) {
                             const hook_result = self.callPropHook(obj, prop_name, .get, .null) catch {
                                 if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
@@ -7762,6 +8262,16 @@ pub const VM = struct {
                             const cvr = self.findPropertyVisibility(obj.class_name, prop_name);
                             if (!self.checkVisibility(cvr.defining_class, cvr.visibility)) {
                                 if (self.hasMethod(obj.class_name, "__get")) {
+                                    if (self.hasMethod(obj.class_name, "__isset")) {
+                                        const present = self.callMethod(obj, "__isset", &.{.{ .string = Value.String.borrowed(prop_name) }}) catch {
+                                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                            return error.RuntimeError;
+                                        };
+                                        if (!present.isTruthy()) {
+                                            self.push(.null);
+                                            continue;
+                                        }
+                                    }
                                     self.push(try self.callMagicGet(obj, prop_name));
                                 } else {
                                     self.push(.null);
@@ -7770,6 +8280,16 @@ pub const VM = struct {
                                 self.push(val);
                             }
                         } else if (self.hasMethod(obj.class_name, "__get")) {
+                            if (self.hasMethod(obj.class_name, "__isset")) {
+                                const present = self.callMethod(obj, "__isset", &.{.{ .string = Value.String.borrowed(prop_name) }}) catch {
+                                    if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                    return error.RuntimeError;
+                                };
+                                if (!present.isTruthy()) {
+                                    self.push(.null);
+                                    continue;
+                                }
+                            }
                             self.push(try self.callMagicGet(obj, prop_name));
                         } else {
                             self.push(.null);
@@ -7779,50 +8299,12 @@ pub const VM = struct {
                     }
                 },
 
-                .get_prop_dynamic => {
-                    const prop_name_val = self.pop();
-                    const obj_val = self.pop();
-                    if (obj_val == .object and prop_name_val == .string) {
-                        const obj = obj_val.object;
-                        const prop_name = prop_name_val.string.bytes();
-                        const val = obj.get(prop_name);
-                        if (val != .null or obj.properties.contains(prop_name) or (obj.slots != null and obj.getSlotIndex(prop_name) != null)) {
-                            self.push(val);
-                        } else if (self.hasMethod(obj.class_name, "__get")) {
-                            const result = try self.callMagicGet(obj, prop_name);
-                            self.push(result);
-                        } else {
-                            self.push(.null);
-                        }
-                    } else {
-                        self.push(.null);
-                    }
-                },
-
-                .set_prop_dynamic => {
-                    const prop_name_val = self.pop();
-                    const new_val = try self.copyValue(self.pop());
-                    const obj_val = self.pop();
-                    if (obj_val == .object and prop_name_val == .string) {
-                        const obj = obj_val.object;
-                        const prop_name = prop_name_val.string.bytes();
-                        const has_prop = obj.properties.contains(prop_name) or (obj.slots != null and obj.getSlotIndex(prop_name) != null);
-                        if (!has_prop and self.hasMethod(obj.class_name, "__set") and !obj.magic_set_active.contains(prop_name)) {
-                            try obj.magic_set_active.put(self.allocator, prop_name, {});
-                            _ = self.callMethod(obj, "__set", &.{ .{ .string = Value.String.borrowed(prop_name) }, new_val }) catch {};
-                            _ = obj.magic_set_active.remove(prop_name);
-                        } else {
-                            try self.objectSetOwned(obj, prop_name, new_val);
-                            self.syncObjPropRefs(obj, prop_name, new_val);
-                        }
-                    }
-                    self.push(new_val);
-                },
-
-                .set_prop => {
+                .set_prop, .set_prop_dynamic => {
                     const sp_ip = self.currentFrame().ip;
-                    const name_idx = self.readU16();
-                    const prop_name = self.currentChunk().constants.items[name_idx].string.bytes();
+                    const prop_name = if (op == .set_prop_dynamic) try self.valueToString(self.pop()) else blk: {
+                        const name_idx = self.readU16();
+                        break :blk self.currentChunk().constants.items[name_idx].string.bytes();
+                    };
                     // transferArg: clone an array, leave an object raw - the
                     // property store retains the object exactly once (obj.set
                     // on the slow path, retainValue on the IC path)
@@ -7836,9 +8318,24 @@ pub const VM = struct {
                     defer if (sp_val_pin) |p| self.objRelease(p);
                     const obj_val = self.pop();
                     if (obj_val == .object) {
-                        const obj = obj_val.object;
+                        var obj = obj_val.object;
+                        obj.refcount +%= 1;
+                        defer self.releaseValue(obj_val);
 
-                        if (obj.lazy_initializer != .null) try self.triggerLazyInit(obj);
+                        if (obj.isLazySlot(prop_name, self.currentDefiningClass())) self.triggerLazyInit(obj) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
+                        obj = obj.storage();
+
+                        // the set-scope gate runs before hooks and __set, but only
+                        // an asymmetric or readonly declaration can ever deny a write
+                        const vr = self.findPropertyVisibility(obj.class_name, prop_name);
+                        if (vr.is_readonly or vr.set_visibility != vr.visibility) {
+                            if (!(obj.isUnset(prop_name) and self.hasMethod(obj.class_name, "__set"))) {
+                                if (try self.checkPropertyMutationVis(obj, prop_name, .write, vr)) continue;
+                            }
+                        }
 
                         // property hooks: dispatch to set hook if present (and not recursing).
                         // an exception thrown inside the hook must dispatch back into the
@@ -7879,7 +8376,7 @@ pub const VM = struct {
                             // fall through to the regular slot/property write
                         }
 
-                        if (self.ic) |ic| {
+                        if (if (op == .set_prop) self.ic else null) |ic| {
                             const sp_idx = InlineCache.propIndex(@intFromPtr(self.currentChunk()), sp_ip);
                             const sp_entry = &ic.prop[sp_idx];
                             if (sp_entry.key == sp_ip and sp_entry.chunk_key == @intFromPtr(self.currentChunk()) and sp_entry.slot_index != 0xFFFF and sp_entry.class_ptr == @intFromPtr(obj.class_name.ptr)) {
@@ -7908,13 +8405,12 @@ pub const VM = struct {
                             }
                         }
 
-                        const has_prop = obj.properties.contains(prop_name) or (obj.slots != null and obj.getSlotIndex(prop_name) != null);
+                        const has_prop = !obj.isUnset(prop_name) and (obj.properties.contains(prop_name) or (obj.slots != null and obj.getSlotIndex(prop_name) != null));
                         if (!has_prop and self.hasMethod(obj.class_name, "__set") and !obj.magic_set_active.contains(prop_name)) {
                             try obj.magic_set_active.put(self.allocator, prop_name, {});
                             _ = self.callMethod(obj, "__set", &.{ .{ .string = Value.String.borrowed(prop_name) }, val }) catch {};
                             _ = obj.magic_set_active.remove(prop_name);
                         } else {
-                            const vr = self.findPropertyVisibility(obj.class_name, prop_name);
                             if (!self.checkVisibility(vr.defining_class, vr.visibility)) {
                                 if (self.hasMethod(obj.class_name, "__set") and !obj.magic_set_active.contains(prop_name)) {
                                     try obj.magic_set_active.put(self.allocator, prop_name, {});
@@ -7926,27 +8422,6 @@ pub const VM = struct {
                                 const msg = try std.fmt.allocPrint(self.allocator, "Cannot access {s} property {s}::${s}", .{
                                     @tagName(vr.visibility), vr.defining_class, prop_name,
                                 });
-                                try self.strings.append(self.allocator, msg);
-                                if (try self.throwBuiltinException("Error", msg)) continue;
-                                return error.RuntimeError;
-                            }
-                            if (vr.set_visibility != vr.visibility and !self.checkVisibility(vr.defining_class, vr.set_visibility)) {
-                                if (self.hasMethod(obj.class_name, "__set") and !obj.magic_set_active.contains(prop_name)) {
-                                    try obj.magic_set_active.put(self.allocator, prop_name, {});
-                                    _ = self.callMethod(obj, "__set", &.{ .{ .string = Value.String.borrowed(prop_name) }, val }) catch {};
-                                    _ = obj.magic_set_active.remove(prop_name);
-                                    self.push(val);
-                                    continue;
-                                }
-                                const scope_name = self.currentDefiningClass();
-                                const msg = if (scope_name) |sn|
-                                    try std.fmt.allocPrint(self.allocator, "Cannot modify {s}(set) property {s}::${s} from scope {s}", .{
-                                        @tagName(vr.set_visibility), vr.defining_class, prop_name, sn,
-                                    })
-                                else
-                                    try std.fmt.allocPrint(self.allocator, "Cannot modify {s}(set) property {s}::${s} from global scope", .{
-                                        @tagName(vr.set_visibility), vr.defining_class, prop_name,
-                                    });
                                 try self.strings.append(self.allocator, msg);
                                 if (try self.throwBuiltinException("Error", msg)) continue;
                                 return error.RuntimeError;
@@ -7975,8 +8450,8 @@ pub const VM = struct {
                             // populate IC for slot-indexed writes. typed
                             // properties are cached too - the fast path runs
                             // checkPropertyType when prop_type is set
-                            if (self.ic) |ic| {
-                                if (vr.visibility == .public and vr.set_visibility == .public) {
+                            if (if (op == .set_prop) self.ic else null) |ic| {
+                                if (vr.visibility == .public and vr.set_visibility == .public and !vr.is_readonly) {
                                     const sp_idx = InlineCache.propIndex(@intFromPtr(self.currentChunk()), sp_ip);
                                     const si = if (obj.slot_layout != null) obj.getSlotIndex(prop_name) orelse @as(u16, 0xFFFF) else @as(u16, 0xFFFF);
                                     ic.prop[sp_idx] = .{ .key = sp_ip, .chunk_key = @intFromPtr(self.currentChunk()), .class_ptr = @intFromPtr(obj.class_name.ptr), .slot_index = si, .prop_type = vr.type_str, .decl_class = vr.defining_class };
@@ -7988,6 +8463,8 @@ pub const VM = struct {
                 },
 
                 .method_call => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const name_idx = self.readU16();
                     const arg_count = self.readByte();
                     const method_name = self.currentChunk().constants.items[name_idx].string.bytes();
@@ -7995,10 +8472,6 @@ pub const VM = struct {
 
                     // object/generator is below args on the stack
                     const obj_val = self.stack[self.sp - ac - 1];
-
-                    if (obj_val == .object and obj_val.object.lazy_initializer != .null) {
-                        try self.triggerLazyInit(obj_val.object);
-                    }
 
                     if (obj_val == .generator) {
                         const gen = obj_val.generator;
@@ -8124,7 +8597,10 @@ pub const VM = struct {
 
                             for (0..ac) |i| self.push(args_buf[i]);
                             if (fiber.callable == .string) {
-                                try self.callNamedFunction(fiber.callable.string.bytes(), @intCast(ac));
+                                self.callNamedFunction(fiber.callable.string.bytes(), @intCast(ac)) catch {
+                                    if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                    return error.RuntimeError;
+                                };
                             } else {
                                 var ctx = self.makeContext(null);
                                 _ = try ctx.invokeCallable(fiber.callable, args_buf[0..ac]);
@@ -8480,6 +8956,7 @@ pub const VM = struct {
                                         self.frame_count -= 1;
                                         self.deinitFrameSlot(self.frame_count);
                                     }
+                                    self.discardArgTransport(handler.sp);
                                     self.sp = handler.sp;
                                     self.push(exc);
                                     self.currentFrame().ip = handler.catch_ip;
@@ -8545,8 +9022,15 @@ pub const VM = struct {
                             try self.fillDefaults(&new_vars, func, ac);
                         }
                         var method_refs: std.StringHashMapUnmanaged(*Value) = .{};
-                        const method_owner = (try self.refIndex()).createOwner();
-                        try self.bindRefParams(ac, func, &new_vars, &method_refs, method_owner);
+                        const method_owner = try self.argRefOwner(func);
+                        self.captureArgSources(ac);
+                        self.bindOwnedRefParams(ac, func, &new_vars, &method_refs, method_owner) catch {
+                            new_vars.deinit(self.allocator);
+                            self.deinitRefSlots(&method_refs);
+                            if (self.ref_index) |ri| ri.releaseOwner(self.allocator, method_owner);
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
                         // bindRefParams may have set a ref binding on a param;
                         // the copyValue above clones the array, breaking the
                         // ref. for params with ref bindings, restore the
@@ -8587,6 +9071,8 @@ pub const VM = struct {
                 },
 
                 .method_call_spread => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const name_idx = self.readU16();
                     const method_name = self.currentChunk().constants.items[name_idx].string.bytes();
                     const args_val = self.pop();
@@ -8612,10 +9098,12 @@ pub const VM = struct {
                         }
                     }
 
-                    var resolved_buf: [16]Value = .{.null} ** 16;
+                    var resolved_buf: [256]Value = .{.null} ** 256;
+                    var resolved_sources: [256]RefSource = undefined;
                     var ac = arr.entries.items.len;
 
                     if (has_named) {
+                        @memset(resolved_sources[0..], .none);
                         const obj_peek = self.stack[self.sp - 1];
                         if (obj_peek == .object) {
                             const full = self.resolveMethod(obj_peek.object.class_name, method_name) catch null;
@@ -8627,12 +9115,14 @@ pub const VM = struct {
                                             for (func.params, 0..) |p, pi| {
                                                 if (std.mem.eql(u8, p[1..], entry.key.string.bytes()) or std.mem.eql(u8, p, entry.key.string.bytes())) {
                                                     resolved_buf[pi] = entry.value;
+                                                    resolved_sources[pi] = self.argArraySource(arr, entry.key);
                                                     if (pi >= pos) pos = pi + 1;
                                                     break;
                                                 }
                                             }
                                         } else {
                                             resolved_buf[pos] = entry.value;
+                                            resolved_sources[pos] = self.argArraySource(arr, entry.key);
                                             pos += 1;
                                         }
                                     }
@@ -8642,18 +9132,21 @@ pub const VM = struct {
                                             resolved_buf[i] = try self.resolveDefault(func.defaults[i]);
                                         }
                                     }
-                                    for (0..ac) |i| self.push(resolved_buf[i]);
+                                    for (0..ac) |i| {
+                                        self.push(resolved_buf[i]);
+                                        self.setArgSource(self.sp - 1, resolved_sources[i]);
+                                    }
                                 } else {
-                                    for (arr.entries.items) |entry| self.push(entry.value);
+                                    for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                                 }
                             } else {
-                                for (arr.entries.items) |entry| self.push(entry.value);
+                                for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                             }
                         } else {
-                            for (arr.entries.items) |entry| self.push(entry.value);
+                            for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                         }
                     } else {
-                        for (arr.entries.items) |entry| self.push(entry.value);
+                        for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                     }
                     const obj_val = self.stack[self.sp - ac - 1];
                     if (obj_val != .object) {
@@ -8707,6 +9200,7 @@ pub const VM = struct {
                                         self.frame_count -= 1;
                                         self.deinitFrameSlot(self.frame_count);
                                     }
+                                    self.discardArgTransport(handler.sp);
                                     self.sp = handler.sp;
                                     self.push(exc);
                                     self.currentFrame().ip = handler.catch_ip;
@@ -8752,10 +9246,20 @@ pub const VM = struct {
                                 if (i < func.defaults.len) try new_vars.put(self.allocator, func.params[i], try self.resolveDefault(func.defaults[i]));
                             }
                         }
+                        var method_refs: std.StringHashMapUnmanaged(*Value) = .{};
+                        const method_owner = try self.argRefOwner(func);
+                        self.captureArgSources(ac);
+                        self.bindOwnedRefParams(ac, func, &new_vars, &method_refs, method_owner) catch {
+                            new_vars.deinit(self.allocator);
+                            self.deinitRefSlots(&method_refs);
+                            if (self.ref_index) |ri| ri.releaseOwner(self.allocator, method_owner);
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
                         self.saveFrameArgs(mcs_ac_u8);
                         self.dropN(ac);
                         self.dropN(1);
-                        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func };
+                        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func, .ref_slots = method_refs, .ref_owner = method_owner };
                         self.setFrameArgCount(mcs_ac_u8);
                         self.frames[self.frame_count].entry_sp = self.sp;
                         self.frame_count += 1;
@@ -8772,6 +9276,8 @@ pub const VM = struct {
                 },
 
                 .method_call_dynamic => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const arg_count = self.readByte();
                     const ac: usize = arg_count;
                     // stack: [object, method_name, arg1, ..., argN]
@@ -8792,11 +9298,14 @@ pub const VM = struct {
                         return error.RuntimeError;
                     }
                     const obj = obj_val.object;
+                    defer self.stackRelease(method_name_val);
                     // shift args down by 1 to remove method_name from stack, leaving [object, arg1, ..., argN]
                     var i: usize = 0;
                     while (i < ac) : (i += 1) {
                         self.stack[self.sp - ac - 1 + i] = self.stack[self.sp - ac + i];
+                        self.setArgSource(self.sp - ac - 1 + i, self.ic.?.arg_stack[self.sp - ac + i]);
                     }
+                    self.clearArgStackFrom(self.sp - 1);
                     self.sp -= 1;
                     // now stack is [object, arg1, ..., argN] - same layout as method_call
                     const full_name = self.resolveMethod(obj.class_name, method_name) catch {
@@ -8854,6 +9363,7 @@ pub const VM = struct {
                                         self.frame_count -= 1;
                                         self.deinitFrameSlot(self.frame_count);
                                     }
+                                    self.discardArgTransport(handler.sp);
                                     self.sp = handler.sp;
                                     self.push(exc);
                                     self.currentFrame().ip = handler.catch_ip;
@@ -8901,10 +9411,20 @@ pub const VM = struct {
                                 }
                             }
                         }
+                        var method_refs: std.StringHashMapUnmanaged(*Value) = .{};
+                        const method_owner = try self.argRefOwner(func);
+                        self.captureArgSources(ac);
+                        self.bindOwnedRefParams(ac, func, &new_vars, &method_refs, method_owner) catch {
+                            new_vars.deinit(self.allocator);
+                            self.deinitRefSlots(&method_refs);
+                            if (self.ref_index) |ri| ri.releaseOwner(self.allocator, method_owner);
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
                         self.saveFrameArgs(arg_count);
                         self.dropN(ac);
                         self.dropN(1);
-                        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func };
+                        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func, .ref_slots = method_refs, .ref_owner = method_owner };
                         self.setFrameArgCount(arg_count);
                         self.frames[self.frame_count].entry_sp = self.sp;
                         self.frame_count += 1;
@@ -8952,7 +9472,7 @@ pub const VM = struct {
                     const ac = arr.entries.items.len;
                     // push object and args back in method_call layout
                     self.push(obj_val);
-                    for (arr.entries.items) |entry| self.push(entry.value);
+                    for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                     const full_name = self.resolveMethod(obj.class_name, method_name) catch {
                         if (self.hasMethod(obj.class_name, "__call")) {
                             const obj_id = @intFromPtr(obj);
@@ -9026,6 +9546,7 @@ pub const VM = struct {
                                         self.frame_count -= 1;
                                         self.deinitFrameSlot(self.frame_count);
                                     }
+                                    self.discardArgTransport(handler.sp);
                                     self.sp = handler.sp;
                                     self.push(exc);
                                     self.currentFrame().ip = handler.catch_ip;
@@ -9073,10 +9594,20 @@ pub const VM = struct {
                                 }
                             }
                         }
+                        var method_refs: std.StringHashMapUnmanaged(*Value) = .{};
+                        const method_owner = try self.argRefOwner(func);
+                        self.captureArgSources(ac);
+                        self.bindOwnedRefParams(ac, func, &new_vars, &method_refs, method_owner) catch {
+                            new_vars.deinit(self.allocator);
+                            self.deinitRefSlots(&method_refs);
+                            if (self.ref_index) |ri| ri.releaseOwner(self.allocator, method_owner);
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
                         self.saveFrameArgs(mcds_ac_u8);
                         self.dropN(ac);
                         self.dropN(1);
-                        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func };
+                        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func, .ref_slots = method_refs, .ref_owner = method_owner };
                         self.setFrameArgCount(mcds_ac_u8);
                         self.frames[self.frame_count].entry_sp = self.sp;
                         self.frame_count += 1;
@@ -9093,6 +9624,8 @@ pub const VM = struct {
                 },
 
                 .static_call => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const class_idx = self.readU16();
                     const method_idx = self.readU16();
                     const arg_count = self.readByte();
@@ -9120,6 +9653,7 @@ pub const VM = struct {
                     }
 
                     if (std.mem.eql(u8, class_name, "Fiber") and std.mem.eql(u8, method_name, "getCurrent")) {
+                        self.clearArgStackFrom(self.sp - @as(usize, arg_count));
                         self.sp -= @as(usize, arg_count);
                         if (self.current_fiber) |fiber| {
                             self.push(.{ .fiber = fiber });
@@ -9276,6 +9810,7 @@ pub const VM = struct {
                                                 self.frame_count -= 1;
                                                 self.deinitFrameSlot(self.frame_count);
                                             }
+                                            self.discardArgTransport(handler.sp);
                                             self.sp = handler.sp;
                                             self.push(exc);
                                             self.currentFrame().ip = handler.catch_ip;
@@ -9306,6 +9841,8 @@ pub const VM = struct {
                 },
 
                 .static_call_spread => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const class_idx = self.readU16();
                     const method_idx = self.readU16();
                     var class_name = self.currentChunk().constants.items[class_idx].string.bytes();
@@ -9386,6 +9923,8 @@ pub const VM = struct {
                     if (has_named_sc) {
                         if (self.functions.get(full_name)) |func2| {
                             var resolved: [256]Value = .{.null} ** 256;
+                            var resolved_sources: [256]RefSource = undefined;
+                            @memset(resolved_sources[0..@min(resolved_sources.len, func2.params.len + arr.entries.items.len)], .none);
                             if (func2.params.len > resolved.len) return error.RuntimeError;
                             var pos: usize = 0;
                             for (arr.entries.items) |entry| {
@@ -9394,22 +9933,27 @@ pub const VM = struct {
                                         const pn = if (p.len > 0 and p[0] == '$') p[1..] else p;
                                         if (std.mem.eql(u8, pn, entry.key.string.bytes())) {
                                             resolved[pi] = entry.value;
+                                            resolved_sources[pi] = self.argArraySource(arr, entry.key);
                                             if (pi >= pos) pos = pi + 1;
                                             break;
                                         }
                                     }
                                 } else {
                                     resolved[pos] = entry.value;
+                                    resolved_sources[pos] = self.argArraySource(arr, entry.key);
                                     pos += 1;
                                 }
                             }
-                            for (0..pos) |i| self.push(resolved[i]);
+                            for (0..pos) |i| {
+                                self.push(resolved[i]);
+                                self.setArgSource(self.sp - 1, resolved_sources[i]);
+                            }
                             resolved_ac = pos;
                         } else {
-                            for (arr.entries.items) |entry| self.push(entry.value);
+                            for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                         }
                     } else {
-                        for (arr.entries.items) |entry| self.push(entry.value);
+                        for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                     }
 
                     if (this_val) |tv| {
@@ -9455,10 +9999,16 @@ pub const VM = struct {
                                 return error.RuntimeError;
                             }
                         } else {
-                            try self.callNamedFunction(full_name, @intCast(resolved_ac));
+                            self.callNamedFunction(full_name, @intCast(resolved_ac)) catch {
+                                if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                                return error.RuntimeError;
+                            };
                         }
                     } else {
-                        try self.callNamedFunction(full_name, @intCast(resolved_ac));
+                        self.callNamedFunction(full_name, @intCast(resolved_ac)) catch {
+                            if (self.pending_exception != null and self.dispatchPendingException(base_frame)) continue;
+                            return error.RuntimeError;
+                        };
                     }
                 },
 
@@ -9506,12 +10056,16 @@ pub const VM = struct {
                     var i: usize = 0;
                     while (i < ac) : (i += 1) {
                         self.stack[self.sp - ac - 1 + i] = self.stack[self.sp - ac + i];
+                        self.setArgSource(self.sp - ac - 1 + i, self.ic.?.arg_stack[self.sp - ac + i]);
                     }
+                    self.clearArgStackFrom(self.sp - 1);
                     self.sp -= 1;
                     try self.callStaticFunction(full_name, arg_count, class_name);
                 },
 
                 .static_call_dyn_method => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const class_idx = self.readU16();
                     const arg_count = self.readByte();
                     var class_name = self.currentChunk().constants.items[class_idx].string.bytes();
@@ -9568,12 +10122,17 @@ pub const VM = struct {
                     var i: usize = 0;
                     while (i < ac) : (i += 1) {
                         self.stack[self.sp - ac - 1 + i] = self.stack[self.sp - ac + i];
+                        self.setArgSource(self.sp - ac - 1 + i, self.ic.?.arg_stack[self.sp - ac + i]);
                     }
+                    self.clearArgStackFrom(self.sp - 1);
                     self.sp -= 1;
+                    defer self.stackRelease(method_val);
                     try self.callStaticFunction(full_name, arg_count, effective_called);
                 },
 
                 .static_call_dyn_both => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const arg_count = self.readByte();
                     const ac: usize = arg_count;
                     const method_val = self.stack[self.sp - ac - 1];
@@ -9634,12 +10193,16 @@ pub const VM = struct {
                     var i: usize = 0;
                     while (i < ac) : (i += 1) {
                         self.stack[self.sp - ac - 2 + i] = self.stack[self.sp - ac + i];
+                        self.setArgSource(self.sp - ac - 2 + i, self.ic.?.arg_stack[self.sp - ac + i]);
                     }
+                    self.clearArgStackFrom(self.sp - 2);
                     self.sp -= 2;
                     try self.callStaticFunction(full_name, arg_count, effective_called);
                 },
 
                 .static_call_dyn_both_spread => {
+                    const cf_scope = try self.enterCallFamily(op);
+                    defer self.leaveCallFamily(cf_scope);
                     const args_val = self.pop();
                     const method_val = self.pop();
                     const class_val = self.pop();
@@ -9680,7 +10243,7 @@ pub const VM = struct {
                         self.setErrorMsg("Fatal error: Uncaught Error: {s}", .{msg});
                         return error.RuntimeError;
                     };
-                    for (arr.entries.items) |entry| self.push(entry.value);
+                    for (arr.entries.items) |entry| self.pushArgEntry(arr, entry);
                     const ac: u8 = @intCast(arr.entries.items.len);
                     try self.callStaticFunction(full_name, ac, class_name);
                 },
@@ -10432,7 +10995,13 @@ pub const VM = struct {
     pub fn setPendingException(self: *VM, class_name: []const u8, message: []const u8) !void {
         const obj = try self.allocator.create(PhpObject);
         self.next_object_id += 1;
-        obj.* = .{ .class_name = class_name, .id = self.next_object_id };
+        const stable_class_name = if (self.classes.getKey(class_name)) |registered| registered else blk: {
+            const owned = try self.allocator.dupe(u8, class_name);
+            errdefer self.allocator.free(owned);
+            try self.strings.append(self.allocator, owned);
+            break :blk owned;
+        };
+        obj.* = .{ .class_name = stable_class_name, .id = self.next_object_id };
         try self.initObjectProperties(obj, class_name);
         try obj.set(self.allocator, "message", .{ .string = Value.String.borrowed(message) });
         try obj.set(self.allocator, "code", .{ .int = 0 });
@@ -10724,7 +11293,13 @@ pub const VM = struct {
     pub fn throwBuiltinException(self: *VM, class_name: []const u8, message: []const u8) !bool {
         const obj = try self.allocator.create(PhpObject);
         self.next_object_id += 1;
-        obj.* = .{ .class_name = class_name, .id = self.next_object_id };
+        const stable_class_name = if (self.classes.getKey(class_name)) |registered| registered else blk: {
+            const owned = try self.allocator.dupe(u8, class_name);
+            errdefer self.allocator.free(owned);
+            try self.strings.append(self.allocator, owned);
+            break :blk owned;
+        };
+        obj.* = .{ .class_name = stable_class_name, .id = self.next_object_id };
         try self.initObjectProperties(obj, class_name);
         try obj.set(self.allocator, "message", .{ .string = Value.String.borrowed(message) });
         try obj.set(self.allocator, "code", .{ .int = 0 });
@@ -10765,6 +11340,8 @@ pub const VM = struct {
             self.deinitFrameSlot(self.frame_count);
         }
 
+        self.discardArgTransport(handler.sp);
+
         self.sp = handler.sp;
         self.push(.{ .object = obj });
         self.currentFrame().ip = handler.catch_ip;
@@ -10783,6 +11360,7 @@ pub const VM = struct {
             self.frame_count -= 1;
             self.deinitFrameSlot(self.frame_count);
         }
+        self.discardArgTransport(handler.sp);
         self.sp = handler.sp;
         self.push(exc);
         self.currentFrame().ip = handler.catch_ip;
@@ -10876,6 +11454,16 @@ pub const VM = struct {
         self.retainFrameObjects(self.frame_count - 1);
         if (self.frame_count > self.frame_high_water) self.frame_high_water = self.frame_count;
 
+        const hook_guard_count = self.prop_hook_guard.items.len;
+        if (std.mem.endsWith(u8, gen.func.name, "$hook_get")) {
+            const name_start = if (std.mem.lastIndexOf(u8, gen.func.name, "::")) |sep| sep + 2 else 0;
+            const prop_name = gen.func.name[name_start .. gen.func.name.len - "$hook_get".len];
+            const receiver = self.currentFrame().vars.get("$this") orelse .null;
+            if (receiver == .object) {
+                try self.prop_hook_guard.append(self.allocator, .{ .obj_ptr = @intFromPtr(receiver.object), .prop_name = prop_name });
+            }
+        }
+        defer self.prop_hook_guard.shrinkRetainingCapacity(hook_guard_count);
         self.restoreGeneratorHandlers(gen);
 
         if (gen.ip > 0) {
@@ -10897,6 +11485,7 @@ pub const VM = struct {
                     self.frame_count -= 1;
                     self.deinitFrameSlot(self.frame_count);
                 }
+                self.clearArgStackFrom(saved_sp);
                 self.sp = saved_sp;
                 self.handler_floor = prev_floor;
                 return error.RuntimeError;
@@ -10906,10 +11495,12 @@ pub const VM = struct {
         self.runUntilFrame(return_frame) catch |err| {
             self.handler_floor = prev_floor;
             if (gen.state == .suspended) {
+                self.clearArgStackFrom(saved_sp);
                 self.sp = saved_sp;
                 return;
             }
             if (gen.state == .completed) {
+                self.clearArgStackFrom(saved_sp);
                 self.sp = saved_sp;
                 return;
             }
@@ -10919,6 +11510,7 @@ pub const VM = struct {
                 self.frame_count -= 1;
                 self.deinitFrameSlot(self.frame_count);
             }
+            self.clearArgStackFrom(saved_sp);
             self.sp = saved_sp;
             if (self.pending_exception != null) {
                 return error.RuntimeError;
@@ -10930,6 +11522,7 @@ pub const VM = struct {
             gen.state = .completed;
             self.releaseGeneratorVars(gen);
         }
+        self.clearArgStackFrom(saved_sp);
         self.sp = saved_sp;
     }
 
@@ -11053,7 +11646,7 @@ pub const VM = struct {
     // set_local / set_var_var do: a slot and its vars mirror share the one
     // reference, a bound reference cell takes its own and propagates
     pub fn setVariableByName(self: *VM, frame: *CallFrame, name: []const u8, val: Value) RuntimeError!void {
-        const slot_names = if (frame.func) |func| func.slot_names else self.global_slot_names;
+        const slot_names = if (frame.func) |func| func.slot_names else frame.slot_names;
         for (slot_names, 0..) |slot_name, si| {
             if (!std.mem.eql(u8, slot_name, name)) continue;
             if (si < frame.locals.len) {
@@ -11061,11 +11654,20 @@ pub const VM = struct {
                 if (frame.func != null) {
                     if (frame.ref_slots.get(name)) |cell| try self.propagateCellWrite(cell, val);
                     try self.storeLocalSlot(frame, slot, val);
+                } else if (frame.include_parent != null) {
+                    if (frame.ref_slots.get(name)) |cell| {
+                        self.setCell(cell, val);
+                        try self.propagateCellWrite(cell, val);
+                    }
+                    if (try frame.vars.fetchPut(self.allocator, name, val)) |old| {
+                        self.releaseValue(old.value);
+                    } else self.releaseValue(frame.locals[slot]);
+                    frame.locals[slot] = val;
+                    try self.syncIncludeLocal(frame, slot, val);
                 } else {
                     self.releaseValue(frame.locals[slot]);
                     frame.locals[slot] = val;
                     try self.setLocalGlobal(slot, val, frame);
-                    try self.syncIncludeLocal(frame, slot, val);
                 }
                 return;
             }
@@ -11200,6 +11802,17 @@ pub const VM = struct {
         }
     }
 
+    fn valueToString(self: *VM, v: Value) RuntimeError![]const u8 {
+        if (v == .string) return v.string.bytes();
+        if (v == .object) return self.objectToString(v.object);
+        if (v == .array) self.emitWarning("Array to string conversion");
+        var buf = std.ArrayListUnmanaged(u8){};
+        try v.format(&buf, self.allocator);
+        const str = try buf.toOwnedSlice(self.allocator);
+        try self.strings.append(self.allocator, str);
+        return str;
+    }
+
     pub fn objectToString(self: *VM, obj: *PhpObject) RuntimeError![]const u8 {
         const method_name = self.resolveMethod(obj.class_name, "__toString") catch {
             // PHP: 'Object of class X could not be converted to string'.
@@ -11240,7 +11853,14 @@ pub const VM = struct {
             }
             var ctx = self.makeContext(null);
             const result = self.invokeNative(native, &ctx, &.{}, null) catch return "Object";
-            if (result == .string) return result.string.bytes();
+            if (result == .string) {
+                const owner = result.string.owner orelse return result.string.bytes();
+                defer result.string.release();
+                if (owner.refcount > 1) return result.string.bytes();
+                const copy = self.allocator.dupe(u8, result.string.bytes()) catch return "Object";
+                self.strings.append(self.allocator, copy) catch return "Object";
+                return copy;
+            }
             var buf = std.ArrayListUnmanaged(u8){};
             result.format(&buf, self.allocator) catch return "Object";
             const s = buf.toOwnedSlice(self.allocator) catch return "Object";
@@ -11303,6 +11923,8 @@ pub const VM = struct {
         const prop_set_vis = try self.allocator.alloc(ClassDef.Visibility, prop_count);
         const prop_has_set_vis = try self.allocator.alloc(bool, prop_count);
         const prop_readonly = try self.allocator.alloc(bool, prop_count);
+        const prop_virtual = try self.allocator.alloc(bool, prop_count);
+        defer self.allocator.free(prop_virtual);
         const prop_final = try self.allocator.alloc(bool, prop_count);
         const prop_promoted = try self.allocator.alloc(bool, prop_count);
         const prop_type = try self.allocator.alloc([]const u8, prop_count);
@@ -11322,7 +11944,9 @@ pub const VM = struct {
         for (0..prop_count) |pi| {
             const pname_idx = self.readU16();
             prop_names[pi] = self.currentChunk().constants.items[pname_idx].string.bytes();
-            prop_has_default[pi] = self.readByte();
+            const default_flags = self.readByte();
+            prop_has_default[pi] = default_flags & 1;
+            prop_virtual[pi] = (default_flags & 2) != 0;
 
             const vis_byte = self.readByte();
 
@@ -11406,6 +12030,12 @@ pub const VM = struct {
             retainValue(default_val);
 
             const effective_readonly = prop_readonly[pi] or def.is_readonly;
+            // PHP 8.5 gives public readonly properties implicit protected(set),
+            // including promoted properties and properties of readonly classes.
+            if (effective_readonly and !prop_has_set_vis[pi] and prop_vis[pi] == .public) {
+                prop_set_vis[pi] = .protected;
+                prop_has_set_vis[pi] = true;
+            }
             // PHP 8.4 implicitly finalizes only asymmetric private(set).
             // Symmetric private private(set) and private readonly are not final.
             const reflection_final =
@@ -11424,6 +12054,7 @@ pub const VM = struct {
                 .is_readonly = effective_readonly,
                 .is_final = reflection_final,
                 .is_promoted = prop_promoted[pi],
+                .is_virtual = prop_virtual[pi],
                 .type_str = prop_type[pi],
                 .doc_comment = prop_doc[pi],
             });
@@ -11586,23 +12217,50 @@ pub const VM = struct {
                 const parent_cls = self.classes.get(parent_class_name) orelse break;
 
                 for (parent_cls.properties.items) |parent_prop| {
-                    if (!parent_prop.is_final) continue;
-
                     for (def.properties.items) |child_prop| {
                         if (!std.mem.eql(u8, parent_prop.name, child_prop.name)) continue;
-
-                        const msg = try std.fmt.allocPrint(
-                            self.allocator,
-                            "Cannot override final property {s}::${s}",
-                            .{ parent_class_name, parent_prop.name },
-                        );
-                        try self.strings.append(self.allocator, msg);
-                        self.error_msg = msg;
-                        return error.RuntimeError;
+                        if (parent_prop.is_final) {
+                            self.setErrorMsg("Cannot override final property {s}::${s}", .{ parent_class_name, parent_prop.name });
+                            return error.RuntimeError;
+                        }
+                        // Private properties are separate declarations, not overrides.
+                        if (parent_prop.visibility == .private) continue;
+                        if (@intFromEnum(child_prop.visibility) > @intFromEnum(parent_prop.visibility)) {
+                            self.setErrorMsg("Access level to {s}::${s} must be {s} (as in class {s}) or weaker", .{ class_name, child_prop.name, @tagName(parent_prop.visibility), parent_class_name });
+                            return error.RuntimeError;
+                        }
+                        // A virtual get-only property imposes no write contract.
+                        const setter = try std.fmt.allocPrint(self.allocator, "{s}$hook_set", .{parent_prop.name});
+                        defer self.allocator.free(setter);
+                        if (parent_prop.is_virtual and !parent_cls.methods.contains(setter)) continue;
+                        if (@intFromEnum(child_prop.set_visibility) > @intFromEnum(parent_prop.set_visibility)) {
+                            if (parent_prop.set_visibility == .public) {
+                                self.setErrorMsg("Set access level of {s}::${s} must be omitted (as in class {s})", .{ class_name, child_prop.name, parent_class_name });
+                            } else {
+                                self.setErrorMsg("Set access level of {s}::${s} must be {s}(set) (as in class {s}) or weaker", .{ class_name, child_prop.name, @tagName(parent_prop.set_visibility), parent_class_name });
+                            }
+                            return error.RuntimeError;
+                        }
                     }
                 }
 
                 current_parent = parent_cls.parent;
+            }
+        }
+
+        for (def.properties.items) |prop| {
+            if (!prop.is_virtual or !prop.has_set_visibility or prop.set_visibility == prop.visibility) continue;
+            const setter = try std.fmt.allocPrint(self.allocator, "{s}$hook_set", .{prop.name});
+            defer self.allocator.free(setter);
+            if (!def.methods.contains(setter)) {
+                self.setErrorMsg("Read-only virtual property {s}::${s} must not specify asymmetric visibility", .{ class_name, prop.name });
+                return error.RuntimeError;
+            }
+            const getter = try std.fmt.allocPrint(self.allocator, "{s}$hook_get", .{prop.name});
+            defer self.allocator.free(getter);
+            if (!def.methods.contains(getter)) {
+                self.setErrorMsg("Write-only virtual property {s}::${s} must not specify asymmetric visibility", .{ class_name, prop.name });
+                return error.RuntimeError;
             }
         }
 
@@ -11649,7 +12307,7 @@ pub const VM = struct {
             // doesn't `implements Bar` directly)
             var iface_walk_parent: ?[]const u8 = class_name;
             while (iface_walk_parent) |cn| {
-                if (self.classes.get(cn)) |cd| {
+                if (if (std.mem.eql(u8, cn, class_name)) @as(?ClassDef, def) else self.classes.get(cn)) |cd| {
                     for (cd.interfaces.items) |iname| {
                         var current_iface: ?[]const u8 = iname;
                         while (current_iface) |in| {
@@ -11667,24 +12325,44 @@ pub const VM = struct {
             }
             var sa_iter = seen_abstract.iterator();
             while (sa_iter.next()) |se| {
-                // walk parent chain looking for a non-abstract implementation
-                var found_concrete = false;
-                if (def.methods.get(se.key_ptr.*)) |m| {
-                    if (!m.is_abstract) found_concrete = true;
-                }
-                if (!found_concrete) {
-                    var pp: ?[]const u8 = def.parent;
-                    while (pp) |pn2| {
-                        if (self.classes.get(pn2)) |pc| {
-                            if (pc.methods.get(se.key_ptr.*)) |pm| {
-                                if (!pm.is_abstract) {
-                                    found_concrete = true;
-                                    break;
+                if (std.mem.indexOf(u8, se.key_ptr.*, "$hook_") != null) {
+                    if (self.resolvePropertyHook(&def, se.key_ptr.*)) |hook| {
+                        if (!hook.info.is_abstract) continue;
+                    } else {
+                        // Only a declared property can satisfy a hook contract.
+                        const split = std.mem.indexOf(u8, se.key_ptr.*, "$hook_").?;
+                        var current: ?*const ClassDef = &def;
+                        var has_property = false;
+                        while (current) |cls| {
+                            for (cls.properties.items) |prop| {
+                                if (std.mem.eql(u8, prop.name, se.key_ptr.*[0..split])) {
+                                    if (!prop.is_virtual and prop.visibility == .public and
+                                        !(std.mem.endsWith(u8, se.key_ptr.*, "$hook_set") and prop.is_readonly)) has_property = true;
                                 }
                             }
-                            pp = pc.parent;
-                        } else break;
+                            current = if (cls.parent) |parent| self.classes.getPtr(parent) else null;
+                        }
+                        if (has_property) continue;
                     }
+                }
+                // Start with the in-progress definition: it is not in classes yet.
+                // Native methods need not have entries in ClassDef.methods, so
+                // check their registry at each level, but never skip an abstract
+                // redeclaration to reach a concrete implementation further up.
+                var found_concrete = false;
+                var implementation_class: ?*const ClassDef = &def;
+                while (implementation_class) |cls| {
+                    if (cls.methods.get(se.key_ptr.*)) |method| {
+                        found_concrete = !method.is_abstract;
+                        break;
+                    }
+                    const full = try std.fmt.allocPrint(self.allocator, "{s}::{s}", .{ cls.name, se.key_ptr.* });
+                    defer self.allocator.free(full);
+                    if (self.native_fns.contains(full)) {
+                        found_concrete = true;
+                        break;
+                    }
+                    implementation_class = if (cls.parent) |parent| self.classes.getPtr(parent) else null;
                 }
                 if (!found_concrete) {
                     const msg = try std.fmt.allocPrint(self.allocator, "Class {s} contains abstract method {s}::{s} and must therefore be declared abstract or implement it", .{ class_name, se.value_ptr.*, se.key_ptr.* });
@@ -12206,6 +12884,32 @@ pub const VM = struct {
         {
             const func = self.functions.get(compile_name) orelse return error.RuntimeError;
             self.stack[self.sp - 1] = try self.newClosureInstance(compile_name, func);
+            // Scope belongs to the closure instance, not to a particular kind
+            // of use capture. Reference-only static closures need it too.
+            const name = self.peek().string.bytes();
+            const lexical_class = self.currentDefiningClass();
+            const this_val = self.getLocalByName("$this");
+            const scope = if (lexical_class != null)
+                self.currentFrame().called_class orelse
+                    (if (this_val == .object) this_val.object.class_name else lexical_class)
+            else
+                null;
+            if (scope) |class_name| {
+                try self.captures.append(self.allocator, .{
+                    .closure_name = name,
+                    .var_name = "$__closure_scope",
+                    .value = .{ .string = Value.String.borrowed(class_name) },
+                });
+                self.capture_index.getPtr(name).?.len += 1;
+            }
+            if (lexical_class) |class_name| {
+                try self.captures.append(self.allocator, .{
+                    .closure_name = name,
+                    .var_name = "$__closure_defclass",
+                    .value = .{ .string = Value.String.borrowed(class_name) },
+                });
+                self.capture_index.getPtr(name).?.len += 1;
+            }
         }
     }
 
@@ -13068,8 +13772,14 @@ pub const VM = struct {
                 try self.propagateCellWrite(cell, value);
             }
             retainValue(value);
-            if (try caller.vars.fetchPut(self.allocator, name, value)) |old| {
-                self.releaseValue(old.value);
+            const replaced = try caller.vars.fetchPut(self.allocator, name, value);
+            if (replaced) |old| self.releaseValue(old.value);
+            for (caller_sn, 0..) |slot_name, i| {
+                if (std.mem.eql(u8, slot_name, name) and i < caller.locals.len) {
+                    if (replaced == null) self.releaseValue(caller.locals[i]);
+                    caller.locals[i] = value;
+                    break;
+                }
             }
         }
     }
@@ -13387,393 +14097,569 @@ pub const VM = struct {
         return frame.vars.get(var_name) orelse .null;
     }
 
+    // argument guards. a guard names the call opcode it feeds and the position
+    // it fills; the callee's signature decides whether the fetch that follows
+    // must record lvalue provenance (by reference, or not resolvable without
+    // side effects) or may run as a plain read. resolution never executes PHP
+    // and never autoloads: an unregistered callee simply captures
+    pub fn argNeedsCapture(self: *VM, chunk: *const Chunk, field: usize, delta: u16, pos: u8, operands: usize) bool {
+        if (self.argCaptureCached(chunk, field, delta, pos, operands)) |cached| return cached;
+        const code = chunk.code.items;
+        const call_ip = field + delta;
+        if (call_ip >= code.len) return true;
+        const args_base = self.argsBase(pos, operands) orelse return true;
+        const slots = guardSlots(code, call_ip);
+        const guard = self.guardIdentity(slots, args_base);
+        const by_value = self.callSiteByValue(chunk, call_ip, pos, args_base) orelse false;
+        if (self.ic) |ic| if (guard) |g| {
+            const chunk_key = @intFromPtr(chunk);
+            ic.intent[InlineCache.intentIndex(chunk_key, field)] = .{ .key = field, .chunk_key = chunk_key, .guard = g, .generation = self.registryGeneration(), .slots = slots, .capture = !by_value };
+        };
+        return !by_value;
+    }
+
+    // the cached answer for a guard site, or null when the site must resolve
+    pub inline fn argCaptureCached(self: *VM, chunk: *const Chunk, field: usize, delta: u16, pos: u8, operands: usize) ?bool {
+        if (delta == 0) return true;
+        const ic = self.ic orelse return null;
+        const chunk_key = @intFromPtr(chunk);
+        const e = &ic.intent[InlineCache.intentIndex(chunk_key, field)];
+        if (e.key != field or e.chunk_key != chunk_key or e.generation != self.registryGeneration()) return null;
+        const args_base = self.argsBase(pos, operands) orelse return true;
+        const guard = self.guardIdentity(e.slots, args_base) orelse return null;
+        if (e.guard != guard) return null;
+        return e.capture;
+    }
+
+    // how many stack slots below the arguments identify the callee: the
+    // receiver or callable (1), a receiver plus a name (2), or the calling
+    // class for static:: dispatch (3)
+    fn guardSlots(code: []const u8, call_ip: usize) u8 {
+        const call_op = std.meta.intToEnum(OpCode, code[call_ip]) catch return 0;
+        return switch (call_op) {
+            .method_call, .method_call_spread, .static_call_dynamic, .new_obj_dynamic, .call_indirect, .static_call_dyn_method => 1,
+            .method_call_dynamic, .method_call_dynamic_spread, .static_call_dyn_both, .static_call_dyn_both_spread => 2,
+            .static_call, .static_call_spread => 3,
+            else => 0,
+        };
+    }
+
+    inline fn guardIdentity(self: *VM, slots: u8, args_base: usize) ?usize {
+        if (slots < 3 and args_base < slots) return null;
+        return switch (slots) {
+            0 => 0,
+            1 => valueIdentity(self.stack[args_base - 1]),
+            2 => blk: {
+                const a = valueIdentity(self.stack[args_base - 2]) orelse break :blk null;
+                const b = valueIdentity(self.stack[args_base - 1]) orelse break :blk null;
+                break :blk a ^ (b *% 0x9E3779B97F4A7C15);
+            },
+            else => if (self.currentFrame().called_class) |cc| @intFromPtr(cc.ptr) else 0,
+        };
+    }
+
+    inline fn registryGeneration(self: *VM) usize {
+        return self.functions.count() + self.native_fns.count() + self.classes.count();
+    }
+
+    // stack index of the first argument slot (or of the spread array)
+    inline fn argsBase(self: *VM, pos: u8, operands: usize) ?usize {
+        const region: usize = switch (pos) {
+            arg_pos_spread => 1,
+            arg_pos_named => 2,
+            else => pos,
+        };
+        if (self.sp < operands + region) return null;
+        return self.sp - operands - region;
+    }
+
+    const arg_pos_spread: u8 = 0xFF;
+    const arg_pos_named: u8 = 0xFE;
+
+    fn callOpU16(code: []const u8, at: usize) u16 {
+        return (@as(u16, code[at]) << 8) | code[at + 1];
+    }
+
+    inline fn valueIdentity(value: Value) ?usize {
+        return switch (value) {
+            .object => |o| @intFromPtr(o.class_name.ptr),
+            .string => |s| @intFromPtr(s.bytes().ptr),
+            .array => null,
+            else => 0,
+        };
+    }
+
+    // true when the callee takes `pos` by value, false when by reference,
+    // null when the callee cannot be resolved without side effects
+    fn callSiteByValue(self: *VM, chunk: *const Chunk, call_ip: usize, pos: u8, args_base: usize) ?bool {
+        const code = chunk.code.items;
+        const consts = chunk.constants.items;
+        const call_op = std.meta.intToEnum(OpCode, code[call_ip]) catch return null;
+        return switch (call_op) {
+            .call, .call_spread => self.functionByValue(consts[callOpU16(code, call_ip + 1)].string.bytes(), pos),
+            .call_indirect => self.callableByValue(self.stack[args_base - 1], pos),
+            .method_call, .method_call_spread => self.methodByValue(self.stack[args_base - 1], consts[callOpU16(code, call_ip + 1)].string.bytes(), pos),
+            .method_call_dynamic, .method_call_dynamic_spread => blk: {
+                const name = self.stack[args_base - 1];
+                if (name != .string) break :blk null;
+                break :blk self.methodByValue(self.stack[args_base - 2], name.string.bytes(), pos);
+            },
+            .static_call, .static_call_spread => self.staticByValue(consts[callOpU16(code, call_ip + 1)].string.bytes(), consts[callOpU16(code, call_ip + 3)].string.bytes(), pos),
+            .static_call_dynamic => self.classValueStaticByValue(self.stack[args_base - 1], consts[callOpU16(code, call_ip + 1)].string.bytes(), pos),
+            .static_call_dyn_method => blk: {
+                const method = self.stack[args_base - 1];
+                if (method != .string) break :blk null;
+                break :blk self.staticByValue(consts[callOpU16(code, call_ip + 1)].string.bytes(), method.string.bytes(), pos);
+            },
+            .static_call_dyn_both, .static_call_dyn_both_spread => blk: {
+                const method = self.stack[args_base - 1];
+                if (method != .string) break :blk null;
+                break :blk self.classValueStaticByValue(self.stack[args_base - 2], method.string.bytes(), pos);
+            },
+            .new_obj => self.constructorByValue(consts[callOpU16(code, call_ip + 1)].string.bytes(), pos),
+            .new_obj_dynamic => blk: {
+                const class_val = self.stack[args_base - 1];
+                break :blk switch (class_val) {
+                    .string => |s| self.constructorByValue(s.bytes(), pos),
+                    .object => |o| self.constructorByValue(o.class_name, pos),
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    }
+
+    fn funcByValue(func: *const ObjFunction, pos: u8) bool {
+        if (pos >= arg_pos_named) return std.mem.indexOfScalar(bool, func.ref_params, true) == null;
+        if (pos < func.ref_params.len) return !func.ref_params[pos];
+        return !(func.is_variadic and func.ref_params.len > 0 and func.ref_params[func.ref_params.len - 1]);
+    }
+
+    fn nativeByValue(name: []const u8, pos: u8) bool {
+        if (pos >= arg_pos_named) return !byref_args.hasByRefParams(name);
+        return !byref_args.isByRef(name, pos);
+    }
+
+    fn resolvedByValue(self: *VM, full: []const u8, pos: u8) ?bool {
+        if (self.functions.get(full)) |func| return funcByValue(func, pos);
+        if (self.native_fns.contains(full)) return !byref_args.hasByRefParams(full) or nativeByValue(full, pos);
+        return null;
+    }
+
+    fn functionByValue(self: *VM, raw_name: []const u8, pos: u8) ?bool {
+        const name = if (raw_name.len > 0 and raw_name[0] == '\\') raw_name[1..] else raw_name;
+        if (self.resolvedByValue(name, pos)) |v| return v;
+        if (std.mem.lastIndexOfScalar(u8, name, '\\')) |sep| {
+            if (self.resolvedByValue(name[sep + 1 ..], pos)) |v| return v;
+        }
+        return null;
+    }
+
+    fn classMethodByValue(self: *VM, class_name: []const u8, method: []const u8, pos: u8, magic: []const u8) ?bool {
+        var buf: [512]u8 = undefined;
+        if (self.classes.get(class_name) == null) {
+            const full = std.fmt.bufPrint(&buf, "{s}::{s}", .{ class_name, method }) catch return null;
+            if (self.native_fns.contains(full)) return nativeByValue(full, pos);
+            return null;
+        }
+        const full = self.resolveMethod(class_name, method) catch {
+            return if (self.hasMethod(class_name, magic)) true else null;
+        };
+        return self.resolvedByValue(full, pos);
+    }
+
+    fn methodByValue(self: *VM, receiver: Value, method: []const u8, pos: u8) ?bool {
+        if (receiver != .object) return null;
+        if (receiver.object.lazy != null) return null;
+        return self.classMethodByValue(receiver.object.class_name, method, pos, "__call");
+    }
+
+    fn intentClassName(self: *VM, raw_class: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, raw_class, "static")) return self.currentFrame().called_class orelse self.currentDefiningClass();
+        if (std.mem.eql(u8, raw_class, "self")) return self.currentDefiningClass();
+        if (std.mem.eql(u8, raw_class, "parent")) {
+            const defining = self.currentDefiningClass() orelse return null;
+            const cls = self.classes.get(defining) orelse return null;
+            return cls.parent;
+        }
+        return if (raw_class.len > 0 and raw_class[0] == '\\') raw_class[1..] else raw_class;
+    }
+
+    fn staticByValue(self: *VM, raw_class: []const u8, method: []const u8, pos: u8) ?bool {
+        const class_name = self.intentClassName(raw_class) orelse return null;
+        return self.classMethodByValue(class_name, method, pos, "__callStatic");
+    }
+
+    fn classValueStaticByValue(self: *VM, class_val: Value, method: []const u8, pos: u8) ?bool {
+        return switch (class_val) {
+            .string => |s| self.staticByValue(s.bytes(), method, pos),
+            .object => |o| self.classMethodByValue(o.class_name, method, pos, "__call"),
+            else => null,
+        };
+    }
+
+    fn constructorByValue(self: *VM, raw_class: []const u8, pos: u8) ?bool {
+        const class_name = self.intentClassName(raw_class) orelse return null;
+        if (self.classes.get(class_name) == null) return null;
+        const full = self.resolveMethod(class_name, "__construct") catch return true;
+        return self.resolvedByValue(full, pos);
+    }
+
+    fn callableByValue(self: *VM, callable: Value, pos: u8) ?bool {
+        switch (callable) {
+            .string => |s| {
+                const bytes = s.bytes();
+                if (std.mem.indexOf(u8, bytes, "::")) |sep| return self.staticByValue(bytes[0..sep], bytes[sep + 2 ..], pos);
+                return self.functionByValue(bytes, pos);
+            },
+            .object => |o| {
+                if (std.mem.eql(u8, o.class_name, "Closure")) return self.callableByValue(o.get("__callable"), pos);
+                return self.methodByValue(callable, "__invoke", pos);
+            },
+            .array => |a| {
+                if (a.entries.items.len != 2) return null;
+                const target = a.entries.items[0].value;
+                const method = a.entries.items[1].value;
+                if (method != .string) return null;
+                return switch (target) {
+                    .object => self.methodByValue(target, method.string.bytes(), pos),
+                    .string => |s| self.staticByValue(s.bytes(), method.string.bytes(), pos),
+                    else => null,
+                };
+            },
+            else => return null,
+        }
+    }
+
+    const CallFamilyScope = struct { base: usize, count: usize, frame: usize };
+
+    // a native callback's own calls run at this frame depth; keep the
+    // enclosing call's output destinations across them. every call family
+    // opcode enters at its start and leaves on every exit path
+    fn enterCallFamily(self: *VM, op: OpCode) RuntimeError!CallFamilyScope {
+        const ic = self.ic.?;
+        const scope: CallFamilyScope = .{ .base = ic.saved_sources.items.len, .count = ic.active_arg_count, .frame = ic.active_frame };
+        if (scope.count > 0) try ic.saved_sources.appendSlice(self.allocator, ic.active_args[0..scope.count]);
+        ic.active_arg_count = 0;
+        const code = self.currentChunk().code.items;
+        const ip = self.currentFrame().ip;
+        const ac: usize = switch (op) {
+            .call, .method_call, .new_obj, .static_call_dyn_method => code[ip + 2],
+            .call_indirect, .method_call_dynamic, .static_call_dyn_both => code[ip],
+            .static_call => code[ip + 4],
+            else => 0,
+        };
+        self.captureArgSources(ac);
+        return scope;
+    }
+
+    fn leaveCallFamily(self: *VM, scope: CallFamilyScope) void {
+        const ic = self.ic.?;
+        self.clearActiveArgSources();
+        if (scope.count > 0) {
+            @memcpy(ic.active_args[0..scope.count], ic.saved_sources.items[scope.base .. scope.base + scope.count]);
+            ic.saved_sources.shrinkRetainingCapacity(scope.base);
+        }
+        ic.active_arg_count = scope.count;
+        ic.active_frame = scope.frame;
+    }
+
     fn isCallFamilyOp(op: OpCode) bool {
         return switch (op) {
-            .call, .call_spread, .call_indirect, .call_indirect_spread, .new_obj, .method_call, .method_call_spread, .method_call_dynamic, .static_call, .static_call_spread, .static_call_dyn_method, .static_call_dyn_both => true,
+            .call, .call_spread, .call_indirect, .call_indirect_spread, .new_obj, .method_call, .method_call_spread, .method_call_dynamic, .static_call, .static_call_spread, .static_call_dyn_method, .static_call_dyn_both, .static_call_dyn_both_spread, .new_obj_dynamic => true,
             else => false,
         };
     }
 
-    fn resolveMixedLvalue(self: *VM, chunk: *const Chunk, caller: *CallFrame, code: []const u8, instrs: []const usize) RefSource {
-        if (instrs.len < 2) return .none;
-        var values: [128]Value = undefined;
-        var value_count: usize = 0;
-        for (instrs, 0..) |pos, index| {
-            const op = std.meta.intToEnum(OpCode, code[pos]) catch return .none;
-            const final = index + 1 == instrs.len;
-            switch (op) {
-                .get_var => {
-                    const ci = (@as(u16, code[pos + 1]) << 8) | code[pos + 2];
-                    if (ci >= chunk.constants.items.len or chunk.constants.items[ci] != .string or value_count >= values.len) return .none;
-                    values[value_count] = self.resolveCallerVar(chunk.constants.items[ci].string.bytes(), false, 0);
-                    value_count += 1;
-                },
-                .get_local => {
-                    const slot = (@as(u16, code[pos + 1]) << 8) | code[pos + 2];
-                    if (slot >= caller.locals.len or value_count >= values.len) return .none;
-                    values[value_count] = caller.locals[slot];
-                    value_count += 1;
-                },
-                .constant => {
-                    const ci = (@as(u16, code[pos + 1]) << 8) | code[pos + 2];
-                    if (ci >= chunk.constants.items.len or value_count >= values.len) return .none;
-                    values[value_count] = chunk.constants.items[ci];
-                    value_count += 1;
-                },
-                .get_prop => {
-                    if (value_count < 1) return .none;
-                    const ci = (@as(u16, code[pos + 1]) << 8) | code[pos + 2];
-                    if (ci >= chunk.constants.items.len or chunk.constants.items[ci] != .string) return .none;
-                    const object = values[value_count - 1];
-                    if (object != .object) return .none;
-                    const prop_name = chunk.constants.items[ci].string.bytes();
-                    if (final) return .{ .chained_prop = .{ .object = object.object, .prop_name = prop_name } };
-                    values[value_count - 1] = object.object.get(prop_name);
-                },
-                .get_prop_dynamic => {
-                    if (value_count < 2) return .none;
-                    const prop = values[value_count - 1];
-                    const object = values[value_count - 2];
-                    if (object != .object or prop != .string) return .none;
-                    value_count -= 1;
-                    if (final) return .{ .chained_prop = .{ .object = object.object, .prop_name = prop.string.bytes() } };
-                    values[value_count - 1] = object.object.get(prop.string.bytes());
-                },
-                .array_get => {
-                    if (value_count < 2) return .none;
-                    const key = values[value_count - 1];
-                    const array = values[value_count - 2];
-                    if (array != .array) return .none;
-                    value_count -= 1;
-                    if (final) return .{ .resolved_array_elem = .{ .array = array.array, .key = key } };
-                    values[value_count - 1] = array.array.get(Value.toArrayKey(key));
-                },
-                else => return .none,
+    // Provenance is an owning transport, independent of the evaluated value.
+    fn captureDimensionCell(self: *VM, slot: usize, array: *PhpArray, key: Value, base: RefSource) RuntimeError!void {
+        const ak = Value.toArrayKey(key);
+        if (!array.contains(ak)) try self.arraySetOwned(array, ak, .null);
+        const entry = array.getPtr(ak).?;
+        const cell = entry.ref orelse blk: {
+            const fresh = try self.newRefCell();
+            self.setCell(fresh, entry.value);
+            self.setEntryRef(entry, fresh);
+            break :blk fresh;
+        };
+        try self.regRefArray(try self.persistentRefOwner(), cell, array, ak);
+        self.array_ref_active = true;
+        self.setArgSource(slot, .{ .cell = .{ .value = cell, .denial = switch (base) {
+            .cell => |c| c.denial,
+            else => null,
+        } } });
+    }
+
+    fn checkArgCell(self: *VM, denial: ?[]const u8) RuntimeError!void {
+        if (denial) |text| {
+            const floor = self.handler_floor;
+            self.handler_floor = self.handler_count;
+            defer self.handler_floor = floor;
+            _ = try self.throwBuiltinException("Error", text);
+            return error.RuntimeError;
+        }
+    }
+
+    fn capturePropertyCell(self: *VM, slot: usize, obj: *PhpObject, name: []const u8) RuntimeError!void {
+        const vr = self.findPropertyVisibility(obj.class_name, name);
+        var denial: ?[]const u8 = null;
+        if (vr.set_visibility != vr.visibility and !self.checkVisibility(vr.defining_class, vr.set_visibility)) {
+            const ro: []const u8 = if (vr.is_readonly and vr.set_visibility == .protected) " readonly" else "";
+            denial = if (self.currentDefiningClass()) |sc|
+                try std.fmt.allocPrint(self.allocator, "Cannot indirectly modify {s}(set){s} property {s}::${s} from scope {s}", .{ @tagName(vr.set_visibility), ro, vr.defining_class, name, sc })
+            else
+                try std.fmt.allocPrint(self.allocator, "Cannot indirectly modify {s}(set){s} property {s}::${s} from global scope", .{ @tagName(vr.set_visibility), ro, vr.defining_class, name });
+        } else if (vr.is_readonly) {
+            denial = try std.fmt.allocPrint(self.allocator, "Cannot modify readonly property {s}::${s}", .{ vr.defining_class, name });
+        }
+        if (denial) |text| try self.strings.append(self.allocator, text);
+        const index = try self.refIndex();
+        const cell = cell: {
+            if (index.prop_rev.get(.{ .object = obj, .class_name = "", .prop_name = name })) |cells| {
+                if (cells.items.len > 0) break :cell cells.items[0];
             }
+            const fresh = try self.newRefCell();
+            self.setCell(fresh, self.stack[slot]);
+            break :cell fresh;
+        };
+        // The property target is weak; receiver reclamation detaches it. The
+        // argument owns the cell, never the temporary receiver.
+        const owned_name = try self.allocator.dupe(u8, name);
+        try self.strings.append(self.allocator, owned_name);
+        try self.regRefObject(try self.persistentRefOwner(), cell, obj, owned_name);
+        self.obj_ref_active = true;
+        self.setArgSource(slot, .{ .cell = .{ .value = cell, .denial = denial } });
+    }
+
+    fn retainArgSource(self: *VM, source: RefSource) RefSource {
+        if (source == .cell) self.bindCell(source.cell.value);
+        return source;
+    }
+
+    fn releaseArgSource(self: *VM, source: *RefSource) void {
+        if (source.* == .none) return;
+        const old = source.*;
+        source.* = .none;
+        switch (old) {
+            .cell => |c| {
+                // A speculative argument reference with only its storage and
+                // final transport holder left must not turn a value read into
+                // a persistent array-element alias.
+                if (cellOf(c.value).binders == 2) {
+                    if (self.ref_index) |ri| {
+                        if (ri.fwd.get(c.value)) |targets| {
+                            if (targets.items.len == 1) {
+                                const target = targets.items[0];
+                                if (target == .array) {
+                                    if (target.array.array.getPtr(target.array.key)) |entry| {
+                                        if (entry.ref == c.value) self.setEntryRef(entry, null);
+                                    }
+                                    ri.removeTargetAllOwners(self.allocator, c.value, target);
+                                } else if (target == .object) {
+                                    ri.removeTargetAllOwners(self.allocator, c.value, target);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.unbindCell(c.value);
+            },
+            .simple, .none => {},
+        }
+    }
+
+    fn discardArgTransport(self: *VM, floor: usize) void {
+        if (floor < self.sp) for (self.stack[floor..self.sp]) |v| {
+            if (v == .array) self.clearArgArraySources(v.array);
+        };
+        self.clearArgStackFrom(floor);
+        if (floor < self.sp) for (self.stack[floor..self.sp]) |v| {
+            if (v == .string) self.stackRelease(v);
+            if (v == .array and v.array.refcount == 0) self.queueArrayRelease(v.array);
+        };
+    }
+
+    // Most operand-stack operations carry no lvalue provenance. Keep that
+    // check inline without pulling source release/ref-index work into hot loops.
+    pub inline fn clearArgStackFrom(self: *VM, floor: usize) void {
+        if (floor >= self.arg_source_end) return;
+        self.clearArgStackFromSlow(floor);
+    }
+
+    // fastLoop pops without visiting the transport, so a slot above sp may
+    // still carry provenance from an earlier call; drop it before reuse
+    fn releaseStaleArgSource(self: *VM, slot: usize) void {
+        const ic = self.ic orelse return;
+        if (ic.arg_stack[slot] != .none) self.releaseArgSource(&ic.arg_stack[slot]);
+    }
+
+    fn clearArgStackFromSlow(self: *VM, floor: usize) void {
+        if (self.ic) |ic| {
+            const end = @min(self.sp, self.arg_source_end);
+            if (floor < end) for (ic.arg_stack[floor..end]) |*source| {
+                if (source.* != .none) self.releaseArgSource(source);
+            };
+            if (self.sp >= self.arg_source_end and floor < self.arg_source_end) self.arg_source_end = floor;
+        }
+    }
+
+    pub fn setArgSource(self: *VM, slot: usize, source: RefSource) void {
+        const ic = self.ic orelse return;
+        if (source == .none and slot >= self.arg_source_end) return;
+        const owned = self.retainArgSource(source);
+        if (ic.arg_stack[slot] != .none) self.releaseArgSource(&ic.arg_stack[slot]);
+        ic.arg_stack[slot] = owned;
+        if (source != .none) self.arg_source_end = @max(self.arg_source_end, slot + 1);
+    }
+
+    fn clearActiveArgSources(self: *VM) void {
+        if (self.ic) |ic| {
+            for (ic.active_args[0..ic.active_arg_count]) |*source| self.releaseArgSource(source);
+            ic.active_arg_count = 0;
+        }
+    }
+
+    fn clearArgArraySources(self: *VM, array: ?*PhpArray) void {
+        const ic = self.ic orelse return;
+        var i: usize = 0;
+        while (i < ic.arg_arrays.items.len) {
+            if (array == null or ic.arg_arrays.items[i].array == array.?) {
+                var entry = ic.arg_arrays.swapRemove(i);
+                self.releaseArgSource(&entry.source);
+                if (entry.key == .string) self.releaseValue(.{ .string = entry.key.string });
+            } else i += 1;
+        }
+    }
+
+    fn recordArgArraySource(self: *VM, array: *PhpArray, key: PhpArray.Key, source: RefSource) !void {
+        const ic = self.ic orelse return;
+        for (ic.arg_arrays.items) |*entry| {
+            if (entry.array == array and entry.key.eql(key)) {
+                const owned = self.retainArgSource(source);
+                self.releaseArgSource(&entry.source);
+                entry.source = owned;
+                return;
+            }
+        }
+        const owned_key: PhpArray.Key = switch (key) {
+            .string => |v| blk: {
+                v.retain();
+                break :blk .{ .string = v };
+            },
+            else => key,
+        };
+        errdefer if (owned_key == .string) self.releaseValue(.{ .string = owned_key.string });
+        var owned = self.retainArgSource(source);
+        errdefer self.releaseArgSource(&owned);
+        try ic.arg_arrays.append(self.allocator, .{ .array = array, .key = owned_key, .source = owned });
+    }
+
+    fn releaseBoundArgSources(self: *VM, owner: ?RefIndex.OwnerId) void {
+        const ic = self.ic orelse return;
+        var i: usize = 0;
+        while (i < ic.bound_arg_sources.items.len) {
+            if (owner == null or ic.bound_arg_sources.items[i].owner == owner.?) {
+                var entry = ic.bound_arg_sources.swapRemove(i);
+                self.releaseArgSource(&entry.source);
+            } else i += 1;
+        }
+    }
+
+    fn argRefOwner(self: *VM, func: *const ObjFunction) RuntimeError!RefIndex.OwnerId {
+        // A nonzero frame owner disables fastLoop local writes. Do not mark
+        // by-value method/constructor frames as reference-bound.
+        if (std.mem.indexOfScalar(bool, func.ref_params, true) == null) return 0;
+        return (try self.refIndex()).createOwner();
+    }
+
+    fn bindOwnedRefParams(self: *VM, ac: usize, func: *const ObjFunction, vars: *std.StringHashMapUnmanaged(Value), refs: *std.StringHashMapUnmanaged(*Value), owner: RefIndex.OwnerId) !void {
+        // By-value calls need neither an owning snapshot nor binding storage.
+        const ref_count = @min(ac, func.ref_params.len);
+        if (std.mem.indexOfScalar(bool, func.ref_params[0..ref_count], true) == null) return;
+        var source_buf: [256]RefSource = undefined;
+        const live_sources = self.callerArgSources(ac);
+        const source_count = @min(live_sources.len, source_buf.len);
+        @memcpy(source_buf[0..source_count], live_sources[0..source_count]);
+        const sources = source_buf[0..source_count];
+        const saved_active_count = self.ic.?.active_arg_count;
+        var saved_active: [256]RefSource = undefined;
+        @memcpy(saved_active[0..saved_active_count], self.ic.?.active_args[0..saved_active_count]);
+        for (self.ic.?.active_args[0..self.ic.?.active_arg_count]) |*source| source.* = self.retainArgSource(source.*);
+        defer {
+            self.clearActiveArgSources();
+            @memcpy(self.ic.?.active_args[0..saved_active_count], saved_active[0..saved_active_count]);
+            self.ic.?.active_arg_count = saved_active_count;
+        }
+        errdefer self.releaseBoundArgSources(owner);
+        for (0..@min(@min(ac, func.ref_params.len), sources.len)) |i| {
+            if (!func.ref_params[i] or sources[i] == .none) continue;
+            var source = self.retainArgSource(sources[i]);
+            errdefer self.releaseArgSource(&source);
+            try self.ic.?.bound_arg_sources.append(self.allocator, .{ .owner = owner, .source = source });
+            self.releaseArgSource(&self.ic.?.active_args[i]);
+            self.ic.?.active_args[i] = self.retainArgSource(source);
+        }
+        // Keep binding names alive with the owner, not the transient active buffer.
+        const active_count = self.ic.?.active_arg_count;
+        var active: [256]RefSource = undefined;
+        @memcpy(active[0..active_count], self.ic.?.active_args[0..active_count]);
+        var position: usize = 0;
+        for (0..@min(@min(ac, func.ref_params.len), sources.len)) |i| {
+            if (!func.ref_params[i] or sources[i] == .none) continue;
+            while (self.ic.?.bound_arg_sources.items[position].owner != owner) position += 1;
+            self.ic.?.active_args[i] = self.ic.?.bound_arg_sources.items[position].source;
+            position += 1;
+        }
+        defer {
+            @memcpy(self.ic.?.active_args[0..active_count], active[0..active_count]);
+            self.ic.?.active_arg_count = active_count;
+        }
+        try self.bindRefParams(ac, func, vars, refs, owner);
+    }
+
+    // provenance of the call being bound, valid until the next capture. a
+    // consumer that binds while argument sources may change copies it first
+    fn callerArgSources(self: *VM, ac: usize) []const RefSource {
+        const ic = self.ic orelse return &.{};
+        if (ic.active_frame != self.frame_count) return &.{};
+        return ic.active_args[0..@min(ac, ic.active_arg_count)];
+    }
+
+    fn captureArgSources(self: *VM, ac: usize) void {
+        const ic = self.ic orelse return;
+        self.clearActiveArgSources();
+        ic.active_frame = self.frame_count;
+        if (ac <= self.sp) {
+            const floor = self.sp - ac;
+            const end = @min(self.sp, self.arg_source_end);
+            if (end <= floor) return;
+            var count = @min(end - floor, 256);
+            while (count > 0 and ic.arg_stack[floor + count - 1] == .none) count -= 1;
+            ic.active_arg_count = count;
+            for (0..count) |i| ic.active_args[i] = self.retainArgSource(ic.arg_stack[floor + i]);
+        }
+    }
+
+    fn argArraySource(self: *VM, arr: *PhpArray, key: PhpArray.Key) RefSource {
+        const ic = self.ic orelse return .none;
+        for (ic.arg_arrays.items) |entry| {
+            if (entry.array == arr and entry.key.eql(key)) return entry.source;
         }
         return .none;
     }
 
-    fn scanCallerArgSources(self: *VM, ac: usize) [16]RefSource {
-        var sources: [16]RefSource = .{.none} ** 16;
-        if (ac == 0) return sources;
-        const caller = self.currentFrame();
-        const chunk = caller.chunk;
-        const ip = caller.ip;
-        if (ip < 2) return sources;
-        const code = chunk.code.items;
-        // determine the call op width: try each plausible op width and pick the one
-        // whose byte at (ip - width) matches its widthFromByte. .call is 4 bytes;
-        // call_indirect / require / method_call_dynamic are 2; etc
-        var call_pos: usize = 0;
-        var found_call = false;
-        // static_call is 6-wide and static_call_spread is 5-wide; without these
-        // the by-ref args of a static method call (e.g. Arr::set($this->items,
-        // ...)) were never classified, so the writeback binding was never made.
-        // require the byte to be an actual call-family opcode so an operand byte
-        // that merely happens to match a non-call op of width w can't false-match
-        const candidates = [_]usize{ 4, 6, 2, 5, 1, 3 };
-        for (candidates) |w| {
-            if (ip < w) continue;
-            const p = ip - w;
-            const b = code[p];
-            if (OpCode.widthFromByte(b) != w) continue;
-            const op = std.meta.intToEnum(OpCode, b) catch continue;
-            if (!isCallFamilyOp(op)) continue;
-            call_pos = p;
-            found_call = true;
-            break;
-        }
-        if (!found_call) return sources;
+    fn pushArgEntry(self: *VM, arr: *PhpArray, entry: PhpArray.Entry) void {
+        self.push(entry.value);
+        self.setArgSource(self.sp - 1, self.argArraySource(arr, entry.key));
+    }
 
-        // bytes to walk backwards from the call site. each PHP arg can
-        // compile to ~3 instructions of ~3 bytes per level of access chain;
-        // a 16-deep chain ~= 16*3*3 = 144 bytes per arg. give plenty of
-        // headroom so deep ->a->b->c->... chains find their root op
-        const max_scan = ac * 96;
-        const region_start = if (call_pos > max_scan) call_pos - max_scan else 0;
-
-        var instrs: [128]usize = undefined;
-        var instr_count: usize = 0;
-        var try_start = region_start;
-        while (try_start < call_pos) : (try_start += 1) {
-            var pos = try_start;
-            var count: usize = 0;
-            while (pos < call_pos and count < 128) {
-                instrs[count] = pos;
-                count += 1;
-                pos += OpCode.widthFromByte(code[pos]);
-            }
-            if (pos == call_pos) {
-                instr_count = count;
-                break;
-            }
-        }
-        if (instr_count == 0) return sources;
-
-        // for call_indirect (and similar indirect calls), the function name was
-        // for both .call and .call_indirect the topmost producers ARE the args
-        // (call_indirect pushes the callable first, then args; .call has the
-        // function name encoded as a u16 constant in the opcode). scan straight
-        var i = instr_count;
-
-        var scan_idx: usize = ac;
-
-        while (scan_idx > 0 and i > 0) {
-            scan_idx -= 1;
-            var depth: i32 = 0;
-            const arg_end = i;
-            var bad_op = false;
-            while (i > 0 and depth < 1) {
-                i -= 1;
-                const pos = instrs[i];
-                const op: OpCode = std.meta.intToEnum(OpCode, code[pos]) catch {
-                    bad_op = true;
-                    break;
-                };
-                // call-family opcodes have a VARIADIC stack effect (1-argc, or
-                // -argc for forms that also pop a receiver/callable) that a fixed
-                // stackEffect() can't express. read argc from the operand so the
-                // backward arg-boundary walk stays correct when an argument is a
-                // function/method call (e.g. Arr::set($x, $k, array_merge(...))).
-                // without this the by-ref lvalue arg is mis-delimited and loses
-                // its writeback binding
-                const eff: i32 = switch (op) {
-                    .ensure_array_var => if (pos + 3 < code.len and code[pos + 3] != 0) 0 else 1,
-                    .call, .new_obj => if (pos + 3 < code.len) 1 - @as(i32, code[pos + 3]) else op.stackEffect(),
-                    .method_call => if (pos + 3 < code.len) -@as(i32, code[pos + 3]) else op.stackEffect(),
-                    .static_call => if (pos + 5 < code.len) 1 - @as(i32, code[pos + 5]) else op.stackEffect(),
-                    .call_indirect => if (pos + 1 < code.len) -@as(i32, code[pos + 1]) else op.stackEffect(),
-                    else => @as(i32, op.stackEffect()),
-                };
-                depth += eff;
-            }
-            if (bad_op or depth < 1) break;
-
-            const arg_instr_count = arg_end - i;
-            if (arg_instr_count >= 5) {
-                const resolved_mixed = self.resolveMixedLvalue(chunk, caller, code, instrs[i..arg_end]);
-                if (resolved_mixed != .none) {
-                    sources[scan_idx] = resolved_mixed;
-                    continue;
-                }
-            }
-
-            if (arg_instr_count == 1) {
-                const aip = instrs[i];
-                if (code[aip] == @intFromEnum(OpCode.get_var)) {
-                    const ci = (@as(u16, code[aip + 1]) << 8) | code[aip + 2];
-                    if (ci < chunk.constants.items.len) {
-                        sources[scan_idx] = .{ .simple = chunk.constants.items[ci].string.bytes() };
-                    }
-                } else if (code[aip] == @intFromEnum(OpCode.get_local)) {
-                    const slot = (@as(u16, code[aip + 1]) << 8) | code[aip + 2];
-                    const sn = if (caller.func) |func| func.slot_names else self.global_slot_names;
-                    if (slot < sn.len) {
-                        sources[scan_idx] = .{ .simple = sn[slot] };
-                    }
-                }
-            } else if (arg_instr_count == 2) {
-                const first_ip = instrs[i];
-                const second_ip = instrs[i + 1];
-                if (code[second_ip] == @intFromEnum(OpCode.get_prop)) {
-                    var var_name: ?[]const u8 = null;
-                    var is_local = false;
-                    var slot: u16 = 0;
-                    if (code[first_ip] == @intFromEnum(OpCode.get_var)) {
-                        const ci = (@as(u16, code[first_ip + 1]) << 8) | code[first_ip + 2];
-                        if (ci < chunk.constants.items.len) var_name = chunk.constants.items[ci].string.bytes();
-                    } else if (code[first_ip] == @intFromEnum(OpCode.get_local)) {
-                        slot = (@as(u16, code[first_ip + 1]) << 8) | code[first_ip + 2];
-                        const sn = if (caller.func) |func| func.slot_names else self.global_slot_names;
-                        if (slot < sn.len) {
-                            var_name = sn[slot];
-                            is_local = true;
-                        }
-                    }
-                    if (var_name) |vn| {
-                        const prop_ci = (@as(u16, code[second_ip + 1]) << 8) | code[second_ip + 2];
-                        if (prop_ci < chunk.constants.items.len) {
-                            if (chunk.constants.items[prop_ci] == .string) {
-                                sources[scan_idx] = .{ .object_prop = .{
-                                    .var_name = vn,
-                                    .is_local = is_local,
-                                    .slot = slot,
-                                    .prop_name = chunk.constants.items[prop_ci].string.bytes(),
-                                } };
-                            }
-                        }
-                    }
-                }
-            } else if (arg_instr_count >= 3) {
-                const first_ip = instrs[i];
-                const last_ip = instrs[i + arg_instr_count - 1];
-                if (arg_instr_count == 3 and code[last_ip] == @intFromEnum(OpCode.array_get)) {
-                    const mid_ip = instrs[i + 1];
-                    var var_name: ?[]const u8 = null;
-                    var is_local = false;
-                    var slot: u16 = 0;
-                    if (code[first_ip] == @intFromEnum(OpCode.get_var)) {
-                        const ci = (@as(u16, code[first_ip + 1]) << 8) | code[first_ip + 2];
-                        if (ci < chunk.constants.items.len) var_name = chunk.constants.items[ci].string.bytes();
-                    } else if (code[first_ip] == @intFromEnum(OpCode.get_local)) {
-                        slot = (@as(u16, code[first_ip + 1]) << 8) | code[first_ip + 2];
-                        const sn = if (caller.func) |func| func.slot_names else self.global_slot_names;
-                        if (slot < sn.len) {
-                            var_name = sn[slot];
-                            is_local = true;
-                        }
-                    }
-                    if (var_name) |vn| {
-                        var key_val: ?Value = null;
-                        if (code[mid_ip] == @intFromEnum(OpCode.constant)) {
-                            const ci = (@as(u16, code[mid_ip + 1]) << 8) | code[mid_ip + 2];
-                            if (ci < chunk.constants.items.len) key_val = chunk.constants.items[ci];
-                        } else if (code[mid_ip] == @intFromEnum(OpCode.get_var)) {
-                            const ci = (@as(u16, code[mid_ip + 1]) << 8) | code[mid_ip + 2];
-                            if (ci < chunk.constants.items.len) {
-                                if (chunk.constants.items[ci] == .string) {
-                                    const kname = chunk.constants.items[ci].string.bytes();
-                                    key_val = caller.vars.get(kname);
-                                    if (key_val == null and caller.locals.len > 0) {
-                                        const sn = if (caller.func) |func| func.slot_names else self.global_slot_names;
-                                        for (sn, 0..) |sn_name, si| {
-                                            if (std.mem.eql(u8, sn_name, kname)) {
-                                                if (si < caller.locals.len) key_val = caller.locals[si];
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else if (code[mid_ip] == @intFromEnum(OpCode.get_local)) {
-                            const kslot = (@as(u16, code[mid_ip + 1]) << 8) | code[mid_ip + 2];
-                            if (kslot < caller.locals.len) key_val = caller.locals[kslot];
-                        }
-                        if (key_val) |kv| {
-                            sources[scan_idx] = .{ .array_elem = .{
-                                .var_name = vn,
-                                .is_local = is_local,
-                                .slot = slot,
-                                .key = kv,
-                            } };
-                        }
-                    }
-                } else if (arg_instr_count == 4 and code[last_ip] == @intFromEnum(OpCode.array_get)) {
-                    // $obj->prop['key'] pattern: get_var/get_local + get_prop + key + array_get
-                    const prop_ip = instrs[i + 1];
-                    const key_ip = instrs[i + 2];
-                    if (code[prop_ip] == @intFromEnum(OpCode.get_prop)) {
-                        var var_name: ?[]const u8 = null;
-                        var is_local = false;
-                        var slot: u16 = 0;
-                        if (code[first_ip] == @intFromEnum(OpCode.get_var)) {
-                            const ci = (@as(u16, code[first_ip + 1]) << 8) | code[first_ip + 2];
-                            if (ci < chunk.constants.items.len) var_name = chunk.constants.items[ci].string.bytes();
-                        } else if (code[first_ip] == @intFromEnum(OpCode.get_local)) {
-                            slot = (@as(u16, code[first_ip + 1]) << 8) | code[first_ip + 2];
-                            const sn = if (caller.func) |func| func.slot_names else self.global_slot_names;
-                            if (slot < sn.len) {
-                                var_name = sn[slot];
-                                is_local = true;
-                            }
-                        }
-                        if (var_name) |vn| {
-                            const pci = (@as(u16, code[prop_ip + 1]) << 8) | code[prop_ip + 2];
-                            if (pci < chunk.constants.items.len and chunk.constants.items[pci] == .string) {
-                                const prop_name = chunk.constants.items[pci].string.bytes();
-                                var key_val: ?Value = null;
-                                if (code[key_ip] == @intFromEnum(OpCode.constant)) {
-                                    const ci = (@as(u16, code[key_ip + 1]) << 8) | code[key_ip + 2];
-                                    if (ci < chunk.constants.items.len) key_val = chunk.constants.items[ci];
-                                } else if (code[key_ip] == @intFromEnum(OpCode.get_var)) {
-                                    const ci = (@as(u16, code[key_ip + 1]) << 8) | code[key_ip + 2];
-                                    if (ci < chunk.constants.items.len) {
-                                        if (chunk.constants.items[ci] == .string) {
-                                            const kname = chunk.constants.items[ci].string.bytes();
-                                            key_val = caller.vars.get(kname);
-                                            if (key_val == null and caller.locals.len > 0) {
-                                                const sn = if (caller.func) |func| func.slot_names else self.global_slot_names;
-                                                for (sn, 0..) |sn_name, si| {
-                                                    if (std.mem.eql(u8, sn_name, kname)) {
-                                                        if (si < caller.locals.len) key_val = caller.locals[si];
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else if (code[key_ip] == @intFromEnum(OpCode.get_local)) {
-                                    const kslot = (@as(u16, code[key_ip + 1]) << 8) | code[key_ip + 2];
-                                    if (kslot < caller.locals.len) key_val = caller.locals[kslot];
-                                }
-                                if (key_val) |kv| {
-                                    sources[scan_idx] = .{ .prop_array_elem = .{
-                                        .var_name = vn,
-                                        .is_local = is_local,
-                                        .slot = slot,
-                                        .prop_name = prop_name,
-                                        .key = kv,
-                                    } };
-                                }
-                            }
-                        }
-                    }
-                } else if (code[last_ip] == @intFromEnum(OpCode.get_prop) or code[last_ip] == @intFromEnum(OpCode.get_prop_dynamic)) {
-                    var current: Value = .null;
-                    if (code[first_ip] == @intFromEnum(OpCode.get_var)) {
-                        const ci = (@as(u16, code[first_ip + 1]) << 8) | code[first_ip + 2];
-                        if (ci < chunk.constants.items.len and chunk.constants.items[ci] == .string) {
-                            current = self.resolveCallerVar(chunk.constants.items[ci].string.bytes(), false, 0);
-                        }
-                    } else if (code[first_ip] == @intFromEnum(OpCode.get_local)) {
-                        const root_slot = (@as(u16, code[first_ip + 1]) << 8) | code[first_ip + 2];
-                        if (root_slot < caller.locals.len) current = caller.locals[root_slot];
-                    }
-
-                    const dynamic_final = code[last_ip] == @intFromEnum(OpCode.get_prop_dynamic);
-                    const intermediate_end = if (dynamic_final) arg_instr_count - 2 else arg_instr_count - 1;
-                    var prop_index: usize = 1;
-                    while (current == .object and prop_index < intermediate_end) : (prop_index += 1) {
-                        const prop_ip = instrs[i + prop_index];
-                        if (code[prop_ip] != @intFromEnum(OpCode.get_prop)) break;
-                        const prop_ci = (@as(u16, code[prop_ip + 1]) << 8) | code[prop_ip + 2];
-                        if (prop_ci >= chunk.constants.items.len or chunk.constants.items[prop_ci] != .string) break;
-                        current = current.object.get(chunk.constants.items[prop_ci].string.bytes());
-                    }
-                    if (current == .object and prop_index == intermediate_end) {
-                        var final_name: ?[]const u8 = null;
-                        if (!dynamic_final) {
-                            const prop_ci = (@as(u16, code[last_ip + 1]) << 8) | code[last_ip + 2];
-                            if (prop_ci < chunk.constants.items.len and chunk.constants.items[prop_ci] == .string) {
-                                final_name = chunk.constants.items[prop_ci].string.bytes();
-                            }
-                        } else {
-                            const name_ip = instrs[i + arg_instr_count - 2];
-                            if (code[name_ip] == @intFromEnum(OpCode.get_var)) {
-                                const name_ci = (@as(u16, code[name_ip + 1]) << 8) | code[name_ip + 2];
-                                if (name_ci < chunk.constants.items.len and chunk.constants.items[name_ci] == .string) {
-                                    const name_value = self.resolveCallerVar(chunk.constants.items[name_ci].string.bytes(), false, 0);
-                                    if (name_value == .string) final_name = name_value.string.bytes();
-                                }
-                            } else if (code[name_ip] == @intFromEnum(OpCode.get_local)) {
-                                const name_slot = (@as(u16, code[name_ip + 1]) << 8) | code[name_ip + 2];
-                                if (name_slot < caller.locals.len and caller.locals[name_slot] == .string) {
-                                    final_name = caller.locals[name_slot].string.bytes();
-                                }
-                            }
-                        }
-                        if (final_name) |prop_name| {
-                            sources[scan_idx] = .{ .chained_prop = .{
-                                .object = current.object,
-                                .prop_name = prop_name,
-                            } };
-                        }
-                    }
-                }
-            }
-        }
-        return sources;
+    // Binding runs below call setup, not in the dispatch loop. Queue an
+    // exception without unwinding caller frames underneath the binding code.
+    fn checkPropertyReferenceBinding(self: *VM, obj: *PhpObject, name: []const u8) RuntimeError!void {
+        const floor = self.handler_floor;
+        self.handler_floor = self.handler_count;
+        defer self.handler_floor = floor;
+        _ = try self.checkPropertyMutation(obj, name, .indirect);
     }
 
     fn bindRefParams(
@@ -13784,12 +14670,10 @@ pub const VM = struct {
         refs: *std.StringHashMapUnmanaged(*Value),
         owner: RefIndex.OwnerId,
     ) !void {
+        _ = owner;
         if (func.ref_params.len == 0) return;
-        // ref_params is per-position. if none of the actually-passed args land
-        // on a ref position, we can skip the expensive bytecode scan entirely.
-        // many framework helpers declare ref params via reflection but
-        // their hot callers never pass an arg in the ref-typed position -
-        // the bytecode scan was a large fraction of release-mode samples
+        // reference flags are per-position; only bind passed reference params.
+        // destinations come from evaluated argument transport, not bytecode
         const ref_window = @min(ac, func.ref_params.len);
         var any_ref = false;
         for (0..ref_window) |ri| {
@@ -13799,10 +14683,27 @@ pub const VM = struct {
             }
         }
         if (!any_ref) return;
-        const arg_sources = self.scanCallerArgSources(ac);
-        for (0..ref_window) |ri| {
-            if (!func.ref_params[ri]) continue;
-            switch (arg_sources[ri]) {
+        var source_buf: [256]RefSource = undefined;
+        const live_sources = self.callerArgSources(ac);
+        const source_count = @min(live_sources.len, source_buf.len);
+        @memcpy(source_buf[0..source_count], live_sources[0..source_count]);
+        const arg_sources = source_buf[0..source_count];
+        for (arg_sources, 0..) |source, ri| {
+            if (ri >= ref_window or !func.ref_params[ri]) continue;
+            if (source == .cell) try self.checkArgCell(source.cell.denial);
+        }
+        for (arg_sources, 0..) |source, ri| {
+            if (ri >= ref_window or !func.ref_params[ri]) continue;
+            switch (source) {
+                .cell => |c| {
+                    if (c.value.* == .array and c.value.array.refcount > 1) {
+                        const separated = try self.shallowCloneCow(c.value.array);
+                        self.setCell(c.value, .{ .array = separated });
+                        try self.propagateCellWrite(c.value, c.value.*);
+                    }
+                    try new_vars.put(self.allocator, func.params[ri], c.value.*);
+                    try self.bindRefSlot(refs, func.params[ri], c.value);
+                },
                 .simple => |caller_var| {
                     if (isSuperglobal(caller_var)) {
                         const cell = try self.superglobalCell(caller_var);
@@ -13839,80 +14740,6 @@ pub const VM = struct {
 
                         try self.bindRefSlot(&self.currentFrame().ref_slots, caller_var, cell);
                         try self.bindRefSlot(refs, func.params[ri], cell);
-                    }
-                },
-                .array_elem => |ae| {
-                    const arr_val = self.resolveCallerVar(ae.var_name, ae.is_local, ae.slot);
-                    if (arr_val == .array) {
-                        const cell = try self.newRefCell();
-                        self.setCell(cell, new_vars.get(func.params[ri]) orelse .null);
-                        // the ref cell is a durable holder - retain its array value, or the
-                        // callee param slot's release at frame teardown frees the array the
-                        // cell (and the caller's ref binding) still points at (Stage 2)
-
-                        try self.bindRefSlot(refs, func.params[ri], cell);
-                        try self.regRefArray(owner, cell, arr_val.array, Value.toArrayKey(ae.key));
-                    }
-                },
-                .object_prop => |obj_ref| {
-                    const obj_val = self.resolveCallerVar(obj_ref.var_name, obj_ref.is_local, obj_ref.slot);
-                    if (obj_val == .object) {
-                        var bound = new_vars.get(func.params[ri]) orelse .null;
-                        // a reference can't stay COW-shared: if $obj->prop holds a
-                        // shared array, give the ref a private copy and point the
-                        // property at it, so an in-place mutation through the ref
-                        // (unset/array_shift - which does NOT fire propagateCellWrite,
-                        // only cell-REASSIGNMENT does) reaches $obj->prop while the
-                        // COW readers keep the original. without this, Arr::forget's
-                        // `unset($this->items[...])` descends + writes back into the
-                        // shared config-items array in place, corrupting readers
-                        if (bound == .array and bound.array.refcount > 1) {
-                            const fresh = try self.shallowCloneCow(bound.array);
-                            bound = .{ .array = fresh };
-                            try new_vars.put(self.allocator, func.params[ri], bound);
-                            try self.objectSetOwned(obj_val.object, obj_ref.prop_name, bound);
-                        }
-                        const cell = try self.newRefCell();
-                        self.setCell(cell, bound);
-                        // the ref cell is a durable holder - retain its array value, or the
-                        // callee param slot's release at frame teardown frees the array the
-                        // cell (and the caller's ref binding) still points at (Stage 2)
-
-                        try self.bindRefSlot(refs, func.params[ri], cell);
-                        try self.regRefObject(owner, cell, obj_val.object, obj_ref.prop_name);
-                        self.obj_ref_active = true;
-                    }
-                },
-                .chained_prop => |cp| {
-                    const cell = try self.newRefCell();
-                    self.setCell(cell, new_vars.get(func.params[ri]) orelse .null);
-
-                    try self.bindRefSlot(refs, func.params[ri], cell);
-                    try self.regRefObject(owner, cell, cp.object, cp.prop_name);
-                    self.obj_ref_active = true;
-                },
-                .resolved_array_elem => |ae| {
-                    const cell = try self.newRefCell();
-                    self.setCell(cell, new_vars.get(func.params[ri]) orelse .null);
-
-                    try self.bindRefSlot(refs, func.params[ri], cell);
-                    try self.regRefArray(owner, cell, ae.array, Value.toArrayKey(ae.key));
-                    self.array_ref_active = true;
-                },
-                .prop_array_elem => |pae| {
-                    const obj_val = self.resolveCallerVar(pae.var_name, pae.is_local, pae.slot);
-                    if (obj_val == .object) {
-                        const prop_val = obj_val.object.get(pae.prop_name);
-                        if (prop_val == .array) {
-                            const cell = try self.newRefCell();
-                            self.setCell(cell, new_vars.get(func.params[ri]) orelse .null);
-                            // the ref cell is a durable holder - retain its array value, or the
-                            // callee param slot's release at frame teardown frees the array the
-                            // cell (and the caller's ref binding) still points at (Stage 2)
-
-                            try self.bindRefSlot(refs, func.params[ri], cell);
-                            try self.regRefArray(owner, cell, prop_val.array, Value.toArrayKey(pae.key));
-                        }
                     }
                 },
                 .none => {},
@@ -14159,6 +14986,52 @@ pub const VM = struct {
         return self.isInstanceOf(caller_class, target_class) or self.isInstanceOf(target_class, caller_class);
     }
 
+    fn shouldCallMagicUnset(self: *VM, obj: *PhpObject, name: []const u8) bool {
+        if (!self.hasMethod(obj.class_name, "__unset")) return false;
+        const vr = self.findPropertyVisibility(obj.class_name, name);
+        return obj.isUnset(name) or !self.checkVisibility(vr.defining_class, vr.visibility) or
+            (obj.getSlotIndex(name) == null and !obj.properties.contains(name));
+    }
+
+    // Property write, reference and dimension handlers share a set-scope gate.
+    // Object interiors are
+    // reads of the property, not mutations of its storage (callers skip this
+    // gate when a dimension operation resolves to an object).
+    const MutationAction = enum { write, indirect, unset };
+
+    fn checkPropertyMutation(self: *VM, obj: *PhpObject, name: []const u8, action: MutationAction) RuntimeError!bool {
+        return self.checkPropertyMutationVis(obj, name, action, self.findPropertyVisibility(obj.class_name, name));
+    }
+
+    fn checkPropertyMutationVis(self: *VM, obj: *PhpObject, name: []const u8, action: MutationAction, vr: VisResult) RuntimeError!bool {
+        var msg: ?[]const u8 = null;
+        if (action == .write and vr.is_readonly and vr.set_visibility == .protected and obj.getForScope(name, if (vr.visibility == .private) vr.defining_class else null) != .null) {
+            msg = try std.fmt.allocPrint(self.allocator, "Cannot modify readonly property {s}::${s}", .{ vr.defining_class, name });
+        } else if (vr.set_visibility != vr.visibility and !self.checkVisibility(vr.defining_class, vr.set_visibility)) {
+            const verb: []const u8 = switch (action) {
+                .write => "modify",
+                .indirect => "indirectly modify",
+                .unset => "unset",
+            };
+            const ro: []const u8 = if (vr.is_readonly and vr.set_visibility == .protected) " readonly" else "";
+            const scope = self.currentDefiningClass();
+            msg = if (scope) |sc|
+                try std.fmt.allocPrint(self.allocator, "Cannot {s} {s}(set){s} property {s}::${s} from scope {s}", .{ verb, @tagName(vr.set_visibility), ro, vr.defining_class, name, sc })
+            else
+                try std.fmt.allocPrint(self.allocator, "Cannot {s} {s}(set){s} property {s}::${s} from global scope", .{ verb, @tagName(vr.set_visibility), ro, vr.defining_class, name });
+        } else if (action == .indirect and !self.checkVisibility(vr.defining_class, vr.visibility)) {
+            msg = try std.fmt.allocPrint(self.allocator, "Cannot access {s} property {s}::${s}", .{ @tagName(vr.visibility), vr.defining_class, name });
+        } else if (action == .indirect and vr.is_readonly) {
+            msg = try std.fmt.allocPrint(self.allocator, "Cannot modify readonly property {s}::${s}", .{ vr.defining_class, name });
+        }
+        if (msg) |text| {
+            try self.strings.append(self.allocator, text);
+            if (try self.throwBuiltinException("Error", text)) return true;
+            return error.RuntimeError;
+        }
+        return false;
+    }
+
     pub const VisResult = struct { visibility: ClassDef.Visibility, defining_class: []const u8, is_readonly: bool = false, set_visibility: ClassDef.Visibility = .public, type_str: []const u8 = "" };
 
     pub fn findPropertyVisibility(self: *VM, class_name: []const u8, prop_name: []const u8) VisResult {
@@ -14183,7 +15056,7 @@ pub const VM = struct {
                 if (self.classes.get(sc)) |scls| {
                     for (scls.properties.items) |prop| {
                         if (std.mem.eql(u8, prop.name, prop_name) and prop.visibility == .private) {
-                            return .{ .visibility = prop.visibility, .defining_class = sc, .is_readonly = prop.is_readonly, .set_visibility = prop.set_visibility, .type_str = prop.type_str };
+                            return .{ .visibility = prop.visibility, .defining_class = sc, .is_readonly = prop.is_readonly, .set_visibility = if (prop.is_readonly and !prop.has_set_visibility and prop.visibility == .public) .protected else prop.set_visibility, .type_str = prop.type_str };
                         }
                     }
                 }
@@ -14193,7 +15066,7 @@ pub const VM = struct {
         while (current) |cn| {
             if (self.classes.get(cn)) |cls| {
                 for (cls.properties.items) |prop| {
-                    if (std.mem.eql(u8, prop.name, prop_name)) return .{ .visibility = prop.visibility, .defining_class = cn, .is_readonly = prop.is_readonly, .set_visibility = prop.set_visibility, .type_str = prop.type_str };
+                    if (std.mem.eql(u8, prop.name, prop_name)) return .{ .visibility = prop.visibility, .defining_class = cn, .is_readonly = prop.is_readonly, .set_visibility = if (prop.is_readonly and !prop.has_set_visibility and prop.visibility == .public) .protected else prop.set_visibility, .type_str = prop.type_str };
                 }
                 current = cls.parent;
             } else break;
@@ -14403,8 +15276,8 @@ pub const VM = struct {
             if (self.closureScopeForFrame(&self.frames[self.frame_count - 1])) |scope|
                 return scope;
         }
-        // walk the call stack from current frame upward to find enclosing class method
-        // closures inside methods need the enclosing method's class for visibility checks
+        // Includes/native bridge frames can inherit scope, but a PHP function
+        // is a lexical boundary: never grant its caller's private access.
         var fi: usize = self.frame_count;
         while (fi > 0) {
             fi -= 1;
@@ -14450,20 +15323,101 @@ pub const VM = struct {
                 }
             }
             if (best) |b| return b;
+            if (frame.func != null) return null;
         }
         return null;
     }
 
+    pub fn triggerLazyProperty(self: *VM, obj: *PhpObject, name: []const u8, scope: ?[]const u8) RuntimeError!void {
+        if (obj.isLazySlot(name, scope)) try self.triggerLazyInit(obj);
+    }
+
     pub fn triggerLazyInit(self: *VM, obj: *PhpObject) RuntimeError!void {
-        if (obj.lazy_initializer == .null) return;
-        const initializer = obj.lazy_initializer;
-        obj.lazy_initializer = .null;
+        const state = obj.lazy orelse return;
+        if (state.initializer == .null or state.running) return;
+        obj.refcount +%= 1;
+        defer self.releaseValue(.{ .object = obj });
+        // Retained snapshots force COW for arrays changed by the initializer.
+        const slots = obj.slots orelse return;
+        const saved = try self.allocator.dupe(Value, slots);
+        defer self.allocator.free(saved);
+        for (saved) |v| retainValue(v);
+        defer for (saved) |v| self.releaseValue(v);
+        var props = try obj.properties.clone(self.allocator);
+        defer props.deinit(self.allocator);
+        for (props.values()) |v| retainValue(v);
+        defer for (props.values()) |v| self.releaseValue(v);
+        var unset = try obj.unset_slots.clone(self.allocator);
+        defer unset.deinit(self.allocator);
+        state.running = true;
+        defer state.running = false;
         var ctx = self.makeContext(null);
-        _ = ctx.invokeCallable(initializer, &.{.{ .object = obj }}) catch |err| {
-            obj.lazy_initializer = initializer;
-            return err;
-        };
+        errdefer {
+            for (slots, saved, 0..) |*slot, v, i| {
+                if (self.ref_index) |ri| {
+                    if (obj.slot_layout) |layout| {
+                        if (ri.prop_rev.contains(.{ .object = obj, .class_name = "", .prop_name = layout.names[i] })) continue;
+                    }
+                }
+                self.releaseValue(slot.*);
+                retainValue(v);
+                slot.* = v;
+            }
+            for (obj.properties.values()) |v| self.releaseValue(v);
+            obj.properties.clearRetainingCapacity();
+            for (props.keys(), props.values()) |k, v| {
+                retainValue(v);
+                obj.properties.put(self.allocator, k, v) catch unreachable;
+            }
+            obj.unset_slots.deinit(self.allocator);
+            obj.unset_slots = unset;
+            unset = .{};
+        }
+        if (state.proxy) {
+            const result = try ctx.invokeCallable(state.initializer, &.{.{ .object = obj }});
+            if (result != .object) {
+                const kind: []const u8 = switch (result) {
+                    .null => "null",
+                    .int => "int",
+                    .bool => "bool",
+                    .float => "float",
+                    .string => "string",
+                    .array => "array",
+                    else => "object",
+                };
+                const msg = try std.fmt.allocPrint(self.allocator, "Lazy proxy factory must return an instance of a class compatible with {s}, {s} returned", .{ obj.class_name, kind });
+                try self.strings.append(self.allocator, msg);
+                try self.setPendingException("TypeError", msg);
+                return error.RuntimeError;
+            }
+            const backing = result.object;
+            if (backing == obj or backing.lazyInitializer() != .null or backing.backingValue() != .null) {
+                try self.setPendingException("Error", "Lazy proxy factory must return a non-lazy object");
+                return error.RuntimeError;
+            }
+            if (!self.isInstanceOf(obj.class_name, backing.class_name) or
+                (if (obj.slots) |v| v.len else 0) != (if (backing.slots) |v| v.len else 0) or
+                (self.hasMethod(obj.class_name, "__clone") and (!self.hasMethod(backing.class_name, "__clone") or !std.mem.eql(u8, try self.resolveMethod(obj.class_name, "__clone"), try self.resolveMethod(backing.class_name, "__clone")))) or
+                (self.hasMethod(obj.class_name, "__destruct") and (!self.hasMethod(backing.class_name, "__destruct") or !std.mem.eql(u8, try self.resolveMethod(obj.class_name, "__destruct"), try self.resolveMethod(backing.class_name, "__destruct")))))
+            {
+                const msg = try std.fmt.allocPrint(self.allocator, "The real instance class {s} is not compatible with the proxy class {s}. The proxy must be a instance of the same class as the real instance, or a sub-class with no additional properties, and no overrides of the __destructor or __clone methods.", .{ backing.class_name, obj.class_name });
+                try self.strings.append(self.allocator, msg);
+                try self.setPendingException("TypeError", msg);
+                return error.RuntimeError;
+            }
+            retainValue(result);
+            state.backing = backing;
+            const initializer = state.initializer;
+            state.initializer = .null;
+            self.releaseValue(initializer);
+            return;
+        }
+        const result = try ctx.invokeCallable(state.initializer, &.{.{ .object = obj }});
+        _ = result;
+        const initializer = state.initializer;
+        state.initializer = .null;
         self.releaseValue(initializer);
+        if (self.hasPendingReleases()) self.drainPendingDestruct();
     }
 
     pub fn propHookName(self: *VM, prop_name: []const u8, kind: enum { get, set }) ?[]const u8 {
@@ -14477,6 +15431,37 @@ pub const VM = struct {
             return null;
         };
         return name;
+    }
+
+    // Adopt the returned source binding, never manufacture storage on a virtual
+    // property. Keep it alive across nested execution and preserve its mirrors.
+    fn takeHookReturnCell(self: *VM) RuntimeError!?*Value {
+        const cell = self.last_return_ref orelse return null;
+        self.bindCell(cell);
+        if (self.last_return_ref_owner != 0) {
+            const ri = try self.refIndex();
+            try ri.transferCell(self.allocator, self.last_return_ref_owner, try self.persistentRefOwner(), cell);
+            ri.releaseOwner(self.allocator, self.last_return_ref_owner);
+            self.last_return_ref_owner = 0;
+        }
+        self.setReturnRef(null);
+        return cell;
+    }
+
+    fn prepareHookArray(self: *VM, cell: *Value) RuntimeError!Value {
+        if (cell.* == .array and cell.array.refcount - cell.array.byref_pins > self.referenceAliasCount(cell)) {
+            const clone = try self.shallowCloneCow(cell.array);
+            self.setCell(cell, .{ .array = clone });
+            try self.propagateCellWrite(cell, cell.*);
+        }
+        return cell.*;
+    }
+
+    fn propGetReturnsRef(self: *VM, obj: *PhpObject, prop_name: []const u8) RuntimeError!bool {
+        const name = self.propHookName(prop_name, .get) orelse return error.OutOfMemory;
+        const full_name = try self.resolveMethod(obj.class_name, name);
+        const func = self.functions.get(full_name) orelse return false;
+        return func.returns_ref;
     }
 
     pub fn inPropHook(self: *VM, obj: *PhpObject, prop_name: []const u8) bool {
@@ -14495,7 +15480,7 @@ pub const VM = struct {
         };
         const hook_name = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prop_name, suffix });
         try self.strings.append(self.allocator, hook_name);
-        if (!self.hasMethod(obj.class_name, hook_name)) return null;
+        if (!self.hasPropHook(obj.class_name, prop_name, if (kind == .get) .get else .set)) return null;
         const obj_id = @intFromPtr(obj);
         try self.prop_hook_guard.append(self.allocator, .{ .obj_ptr = obj_id, .prop_name = prop_name });
         defer {
@@ -14556,7 +15541,7 @@ pub const VM = struct {
         };
         var buf: [256]u8 = undefined;
         const hook_name = std.fmt.bufPrint(&buf, "{s}{s}", .{ prop_name, suffix }) catch return false;
-        const result = self.hasMethod(class_name, hook_name);
+        const result = if (self.classes.getPtr(class_name)) |cls| self.resolvePropertyHook(cls, hook_name) != null else false;
         self.has_hook_cache_class = class_name;
         self.has_hook_cache_prop = prop_name;
         self.has_hook_cache_kind = kind_bit;
@@ -14574,6 +15559,25 @@ pub const VM = struct {
             const parent = cls.parent orelse return;
             if (!self.classes.contains(parent)) self.tryAutoload(parent) catch return;
             current = parent;
+        }
+    }
+
+    // An ordinary redeclaration supplies storage implementations for abstract
+    // hooks, but retains concrete hooks inherited from its ancestors.
+    pub fn resolvePropertyHook(self: *VM, start: *const ClassDef, method: []const u8) ?struct { declaring: []const u8, info: ClassDef.MethodInfo } {
+        const split = std.mem.indexOf(u8, method, "$hook_") orelse return null;
+        const prop_name = method[0..split];
+        var backed_replacement = false;
+        var cls = start;
+        while (true) {
+            if (cls.methods.get(method)) |info| {
+                if (info.is_abstract and backed_replacement) return null;
+                return .{ .declaring = cls.name, .info = info };
+            }
+            for (cls.properties.items) |prop| {
+                if (std.mem.eql(u8, prop.name, prop_name) and !prop.is_virtual) backed_replacement = true;
+            }
+            cls = self.classes.getPtr(cls.parent orelse return null) orelse return null;
         }
     }
 
@@ -14607,8 +15611,14 @@ pub const VM = struct {
             }
             break false;
         };
-        self.has_method_cache_class = class_name;
-        self.has_method_cache_method = method_name;
+        if (class_name.len > self.has_method_cache_class_storage.len or method_name.len > self.has_method_cache_method_storage.len) {
+            self.has_method_cache_fn_count = std.math.maxInt(usize);
+            return result;
+        }
+        @memcpy(self.has_method_cache_class_storage[0..class_name.len], class_name);
+        @memcpy(self.has_method_cache_method_storage[0..method_name.len], method_name);
+        self.has_method_cache_class = self.has_method_cache_class_storage[0..class_name.len];
+        self.has_method_cache_method = self.has_method_cache_method_storage[0..method_name.len];
         self.has_method_cache_result = result;
         self.has_method_cache_fn_count = fn_count;
         self.has_method_cache_cls_count = cls_count;
@@ -14634,8 +15644,14 @@ pub const VM = struct {
             return self.method_cache_result;
         }
         const result = try self.resolveMethodSlow(class_name, method_name);
-        self.method_cache_class = class_name;
-        self.method_cache_method = method_name;
+        if (class_name.len > self.method_cache_class_storage.len or method_name.len > self.method_cache_method_storage.len) {
+            self.method_cache_fn_count = std.math.maxInt(usize);
+            return result;
+        }
+        @memcpy(self.method_cache_class_storage[0..class_name.len], class_name);
+        @memcpy(self.method_cache_method_storage[0..method_name.len], method_name);
+        self.method_cache_class = self.method_cache_class_storage[0..class_name.len];
+        self.method_cache_method = self.method_cache_method_storage[0..method_name.len];
         self.method_cache_result = result;
         self.method_cache_fn_count = fn_count;
         self.method_cache_cls_count = cls_count;
@@ -15052,7 +16068,29 @@ pub const VM = struct {
     // does not own arrays and a refcount-0 array arg is never queued, so it
     // cannot be freed mid-native - retaining arrays here would instead
     // QUEUE them (releaseValue queues at 0) and free live data (Stage 2)
-    fn invokeNative(self: *VM, native: NativeFn, ctx: *NativeContext, native_args: []const Value, name: ?[]const u8) RuntimeError!Value {
+    fn invokeNative(self: *VM, native: NativeFn, ctx: *NativeContext, input_args: []const Value, name: ?[]const u8) RuntimeError!Value {
+        var args_buf: [256]Value = undefined;
+        if (input_args.len > args_buf.len) return error.RuntimeError;
+        var native_args = input_args;
+        // only a call whose arguments recorded provenance can bind an output
+        // position; by-value sites skip the name lookup entirely
+        const sources = self.callerArgSources(input_args.len);
+        if (name) |n| if (sources.len > 0 and byref_args.hasByRefParams(n)) {
+            for (sources, 0..) |source, i| {
+                if (source != .cell or !byref_args.isByRef(n, i)) continue;
+                // array_multisort's variadic integers are flags, not outputs
+                const base = if (std.mem.lastIndexOfScalar(u8, n, '\\')) |pos| n[pos + 1 ..] else n;
+                if (std.ascii.eqlIgnoreCase(base, "array_multisort") and input_args[i] != .array) continue;
+                try self.checkArgCell(source.cell.denial);
+            }
+            if (sources.len > 0 and sources[0] != .none and input_args[0] == .array and input_args[0].array.refcount > 1 and byref_args.arg0IsByRef(n)) {
+                const separated: Value = .{ .array = try self.shallowCloneCow(input_args[0].array) };
+                @memcpy(args_buf[0..input_args.len], input_args);
+                args_buf[0] = separated;
+                native_args = args_buf[0..input_args.len];
+                ctx.setCallerVar(0, native_args.len, separated);
+            }
+        };
         for (native_args) |a| stackRetain(a);
         defer for (native_args) |a| self.stackRelease(a);
         // an array argument with no durable owner (a literal, a call result)
@@ -15071,15 +16109,7 @@ pub const VM = struct {
             };
         }
         const result = try native(ctx, native_args);
-        if (result == .string and result.string.owner != null) {
-            for (native_args) |arg| {
-                if (arg == .string and arg.string.owner == result.string.owner) {
-                    result.string.retain();
-                    break;
-                }
-            }
-        }
-        return result;
+        return result.value;
     }
 
     pub fn bindClosures(self: *VM, vars: *std.StringHashMapUnmanaged(Value), ref_slots: ?*std.StringHashMapUnmanaged(*Value), name: []const u8) !void {
@@ -15274,7 +16304,13 @@ pub const VM = struct {
         }
         const obj = try self.allocator.create(PhpObject);
         self.next_object_id += 1;
-        obj.* = .{ .class_name = class_name, .id = self.next_object_id };
+        const stable_class_name = if (self.classes.getKey(class_name)) |registered| registered else blk: {
+            const owned = try self.allocator.dupe(u8, class_name);
+            errdefer self.allocator.free(owned);
+            try self.strings.append(self.allocator, owned);
+            break :blk owned;
+        };
+        obj.* = .{ .class_name = stable_class_name, .id = self.next_object_id };
         try self.objects.append(self.allocator, obj);
         try self.initObjectProperties(obj, class_name);
 
@@ -15760,7 +16796,7 @@ pub const VM = struct {
     // property write coercion rejects null for such a type, so a null slot
     // value can only mean the property is still uninitialized. union types are
     // treated conservatively (skipped) - they might admit null
-    fn typedPropForbidsNull(_: *VM, type_str: []const u8) bool {
+    pub fn typedPropForbidsNull(_: *VM, type_str: []const u8) bool {
         if (type_str.len == 0) return false; // untyped
         if (type_str[0] == '?') return false; // ?T
         if (std.mem.indexOfScalar(u8, type_str, '|') != null) return false; // union
@@ -15877,6 +16913,7 @@ pub const VM = struct {
     // parameter fall into a variadic param keyed by their name. when set, its
     // entries are merged into the variadic rest array
     fn callNamedFunctionV(self: *VM, raw_name: []const u8, arg_count: u8, named_extras: ?*PhpArray) RuntimeError!void {
+        self.captureArgSources(arg_count);
         // PHP normalizes leading-backslash on function callable strings
         const name = if (raw_name.len > 0 and raw_name[0] == '\\') raw_name[1..] else raw_name;
         if (self.dbg_profile_enabled) {
@@ -15926,6 +16963,7 @@ pub const VM = struct {
                             self.frame_count -= 1;
                             self.deinitFrameSlot(self.frame_count);
                         }
+                        self.discardArgTransport(handler.sp);
                         self.sp = handler.sp;
                         self.push(exc);
                         self.currentFrame().ip = handler.catch_ip;
@@ -16005,7 +17043,12 @@ pub const VM = struct {
             }
             var callee_refs = closure_refs;
             const callee_owner = (try self.refIndex()).createOwner();
-            try self.bindRefParams(ac, func, &new_vars, &callee_refs, callee_owner);
+            self.bindOwnedRefParams(ac, func, &new_vars, &callee_refs, callee_owner) catch |err| {
+                new_vars.deinit(self.allocator);
+                self.deinitRefSlots(&callee_refs);
+                if (self.ref_index) |ri| ri.releaseOwner(self.allocator, callee_owner);
+                return err;
+            };
 
             if (func.is_generator) {
                 // by-ref params: ref_slots on the generator so subsequent
@@ -16074,6 +17117,20 @@ pub const VM = struct {
     }
 
     pub fn callMethod(self: *VM, obj: *PhpObject, method_name: []const u8, args: []const Value) RuntimeError!Value {
+        // A native callback may execute calls at the same VM frame depth.
+        // Restore the enclosing call's output-argument destinations afterwards.
+        const saved_sources_count = self.ic.?.active_arg_count;
+        var saved_sources: [256]RefSource = undefined;
+        @memcpy(saved_sources[0..saved_sources_count], self.ic.?.active_args[0..saved_sources_count]);
+        const saved_source_frame = self.ic.?.active_frame;
+        for (self.ic.?.active_args[0..self.ic.?.active_arg_count]) |*source| source.* = self.retainArgSource(source.*);
+        defer {
+            self.clearActiveArgSources();
+            @memcpy(self.ic.?.active_args[0..saved_sources_count], saved_sources[0..saved_sources_count]);
+            self.ic.?.active_arg_count = saved_sources_count;
+            self.ic.?.active_frame = saved_source_frame;
+        }
+
         if (self.frame_count >= 2047) {
             self.error_msg = "Fatal error: maximum call stack depth exceeded";
             return error.RuntimeError;
@@ -16265,6 +17322,20 @@ pub const VM = struct {
     }
 
     pub fn callByName(self: *VM, raw_name: []const u8, args: []const Value) RuntimeError!Value {
+        // A native callback may execute calls at the same VM frame depth.
+        // Restore the enclosing call's output-argument destinations afterwards.
+        const saved_sources_count = self.ic.?.active_arg_count;
+        var saved_sources: [256]RefSource = undefined;
+        @memcpy(saved_sources[0..saved_sources_count], self.ic.?.active_args[0..saved_sources_count]);
+        const saved_source_frame = self.ic.?.active_frame;
+        for (self.ic.?.active_args[0..self.ic.?.active_arg_count]) |*source| source.* = self.retainArgSource(source.*);
+        defer {
+            self.clearActiveArgSources();
+            @memcpy(self.ic.?.active_args[0..saved_sources_count], saved_sources[0..saved_sources_count]);
+            self.ic.?.active_arg_count = saved_sources_count;
+            self.ic.?.active_frame = saved_source_frame;
+        }
+
         // PHP normalizes leading-backslash on function callable strings:
         // call_user_func('\App\f') and call_user_func('App\f') are equivalent
         const name = if (raw_name.len > 0 and raw_name[0] == '\\') raw_name[1..] else raw_name;
@@ -16285,6 +17356,7 @@ pub const VM = struct {
             if (args.len < func.required_params) return error.RuntimeError;
             if (self.ic) |ic| ic.pending_arg_count = @intCast(@min(args.len, 255));
             self.pending_call_name = name;
+            self.pending_called_class = self.closureScopeByName(name);
             const saved_pia_outer = self.pending_invoke_args;
             self.pending_invoke_args = args;
             defer self.pending_invoke_args = saved_pia_outer;
@@ -16461,6 +17533,8 @@ pub const VM = struct {
             }
             try self.fillDefaults(&new_vars, func, bind_count);
 
+            self.pending_call_name = name;
+            self.pending_called_class = self.closureScopeByName(name);
             const result = try self.executeFunctionWithRefs(func, new_vars, ref_slots);
 
             for (0..bind_count) |i| {
@@ -16503,6 +17577,7 @@ pub const VM = struct {
                 self.frame_count -= 1;
                 self.deinitFrameSlot(self.frame_count);
             }
+            self.clearArgStackFrom(base_sp);
             self.sp = base_sp;
             self.handler_count = base_handler;
             return err;
@@ -16515,6 +17590,7 @@ pub const VM = struct {
             fiber.return_value = self.popTransfer();
             if (fiber.return_value == .array) retainValue(fiber.return_value);
         }
+        self.clearArgStackFrom(base_sp);
         self.sp = base_sp;
         return .null;
     }
@@ -16550,6 +17626,7 @@ pub const VM = struct {
         for (self.stack[base_sp..self.sp]) |val| {
             try fiber.saved_stack.append(self.allocator, val);
         }
+        self.clearArgStackFrom(base_sp);
         self.sp = base_sp;
 
         // save exception handlers as relative offsets
@@ -16607,14 +17684,14 @@ pub const VM = struct {
         fiber.saved_handlers.clearRetainingCapacity();
     }
 
-    fn readByte(self: *VM) u8 {
+    inline fn readByte(self: *VM) u8 {
         const frame = &self.frames[self.frame_count - 1];
         const byte = frame.chunk.code.items[frame.ip];
         frame.ip += 1;
         return byte;
     }
 
-    fn readU16(self: *VM) u16 {
+    inline fn readU16(self: *VM) u16 {
         const hi: u16 = self.readByte();
         const lo: u16 = self.readByte();
         return (hi << 8) | lo;
@@ -16718,20 +17795,14 @@ pub const VM = struct {
     }
 
     fn pushNativeResult(self: *VM, value: Value) void {
-        self.pushCallResult(value);
-    }
-
-    // a call result (callMethod / callByName / executeFunction*) is a borrowed
-    // reference: its last owning reference has been released into the deferred
-    // queues, so it stays valid until the next drain and whoever stores or
-    // pushes it retains it. a refcount-zero owned string is exactly that
-    // state; an owned string at refcount >= 1 is a native's own result and
-    // moves onto the stack as the transfer of that reference
-    fn pushCallResult(self: *VM, value: Value) void {
         if (value == .string and value.string.owner != null and value.string.owner.?.refcount > 0) {
             self.pushTransfer(value);
-            return;
-        }
+        } else self.push(value);
+    }
+
+    // call results borrow storage until the next release drain. Other holders
+    // may still own the same value, so its refcount does not identify ownership.
+    fn pushCallResult(self: *VM, value: Value) void {
         self.push(value);
     }
 
@@ -16740,15 +17811,16 @@ pub const VM = struct {
         return value;
     }
 
-    fn pushTransfer(self: *VM, value: Value) void {
+    inline fn pushTransfer(self: *VM, value: Value) void {
         if (value == .string) {
             if (value.string.owner) |owner| self.removePendingStringRelease(owner);
         }
+        if (self.sp < self.arg_source_end) self.releaseStaleArgSource(self.sp);
         self.stack[self.sp] = value;
         self.sp += 1;
     }
 
-    fn push(self: *VM, value: Value) void {
+    inline fn push(self: *VM, value: Value) void {
         if (value == .string) {
             if (value.string.owner) |owner| self.removePendingStringRelease(owner);
         }
@@ -16759,11 +17831,13 @@ pub const VM = struct {
         // it cycle 0->1->0 and be freed while still live. arrays are freed
         // only when their durable container releases them (refcounting Stage 2)
         stackRetain(value);
+        if (self.sp < self.arg_source_end) self.releaseStaleArgSource(self.sp);
         self.stack[self.sp] = value;
         self.sp += 1;
     }
 
     fn pop(self: *VM) Value {
+        self.clearArgStackFrom(self.sp - 1);
         self.sp -= 1;
         const v = self.stack[self.sp];
         self.stackRelease(v);
@@ -16771,6 +17845,7 @@ pub const VM = struct {
     }
 
     fn popTransfer(self: *VM) Value {
+        self.clearArgStackFrom(self.sp - 1);
         self.sp -= 1;
         return self.stack[self.sp];
     }
@@ -16782,12 +17857,13 @@ pub const VM = struct {
     pub fn dropN(self: *VM, n: usize) void {
         var k: usize = 0;
         while (k < n) : (k += 1) {
+            self.clearArgStackFrom(self.sp - 1);
             self.sp -= 1;
             self.stackRelease(self.stack[self.sp]);
         }
     }
 
-    fn peek(self: *const VM) Value {
+    inline fn peek(self: *const VM) Value {
         return self.stack[self.sp - 1];
     }
 
@@ -16821,10 +17897,10 @@ pub const VM = struct {
         if (obj.refcount != 0) {
             // refcount went down but not to 0: object might be part of an
             // unreachable cycle (a -> b -> a where both still see each other).
-            // queue as a cycle-collector candidate. dedupe is handled inside
-            // collectCycles via the visited map - cheap to append duplicates
-            if (!obj.destructed) {
-                self.cycle_candidates.append(self.allocator, obj) catch {};
+            // each possible root occupies one candidate slot.
+            if (!obj.destructed and !obj.cycle_queued) {
+                self.cycle_candidates.append(self.allocator, obj) catch return;
+                obj.cycle_queued = true;
             }
             return;
         }
@@ -16855,27 +17931,30 @@ pub const VM = struct {
             self.pending_fiber_release.clearRetainingCapacity();
             self.fiber_release_cursor = 0;
             for (self.released_arrays.items) |arr| {
-                var i: usize = 0;
-                while (i < self.cycle_array_candidates.items.len) {
-                    if (self.cycle_array_candidates.items[i] == arr) {
-                        _ = self.cycle_array_candidates.swapRemove(i);
-                    } else {
-                        i += 1;
+                if (arr.cycle_queued) {
+                    for (self.cycle_array_candidates.items, 0..) |candidate, i| {
+                        if (candidate == arr) {
+                            _ = self.cycle_array_candidates.swapRemove(i);
+                            break;
+                        }
                     }
+                    arr.cycle_queued = false;
                 }
+                self.clearArgArraySources(arr);
                 arr.deinit(self.allocator);
                 arr.pooled = true;
                 self.free_arrays.append(self.allocator, arr) catch {};
             }
             self.released_arrays.clearRetainingCapacity();
             for (self.released_objects.items) |obj| {
-                var i: usize = 0;
-                while (i < self.cycle_candidates.items.len) {
-                    if (self.cycle_candidates.items[i] == obj) {
-                        _ = self.cycle_candidates.swapRemove(i);
-                    } else {
-                        i += 1;
+                if (obj.cycle_queued) {
+                    for (self.cycle_candidates.items, 0..) |candidate, i| {
+                        if (candidate == obj) {
+                            _ = self.cycle_candidates.swapRemove(i);
+                            break;
+                        }
                     }
+                    obj.cycle_queued = false;
                 }
                 obj.deinit(self.allocator);
                 obj.pooled = true;
@@ -16910,7 +17989,7 @@ pub const VM = struct {
                 if (self.valueInGlobalsCell(.{ .object = obj })) continue;
                 if (self.debug_gc_verify) self.gcVerifyDestructing(obj);
                 obj.destructed = true;
-                if (self.hasMethod(obj.class_name, "__destruct")) {
+                if (obj.ownsDestructor() and self.hasMethod(obj.class_name, "__destruct")) {
                     _ = self.callMethod(obj, "__destruct", &.{}) catch {
                         // a throwing destructor must not corrupt the drop site
                         // it was called from - swallow (revisit for fidelity)
@@ -17044,8 +18123,10 @@ pub const VM = struct {
     // 4. remaining nodes (scratch_rc == 0) are unreachable cycles - destruct
     //    + free
     pub fn collectCycles(self: *VM) usize {
-        if (self.draining_destructors) return 0;
-        if (self.cycle_candidates.items.len == 0 and self.cycle_array_candidates.items.len == 0) return 0;
+        if (self.draining_destructors or self.collecting_cycles) return 0;
+        self.collecting_cycles = true;
+        defer self.collecting_cycles = false;
+        if (self.cycle_candidates.items.len == 0 and self.cycle_array_candidates.items.len == 0 and self.capture_index.count() == 0) return 0;
         self.gc_runs += 1;
         // drain any pending normal destructs first so the candidate set
         // doesn't include objects that are about to be released anyway
@@ -17056,7 +18137,16 @@ pub const VM = struct {
         var visited_arrs = std.AutoArrayHashMapUnmanaged(*PhpArray, void){};
         defer visited_arrs.deinit(self.allocator);
 
+        defer {
+            self.cycle_closures.deinit(self.allocator);
+            self.cycle_closures = .{};
+        }
         for (self.ref_cells.items) |cell| cell.visited = false;
+
+        var closure_ranges = self.capture_index.valueIterator();
+        while (closure_ranges.next()) |range| {
+            if (range.owner) |owner| self.cycleVisitChild(.{ .string = .{ .ptr = owner.bytes.ptr, .len = owner.bytes.len, .owner = owner } }, &visited_objs, &visited_arrs);
+        }
 
         // pass 1: BFS from candidates, init scratch_rc on first visit
         for (self.cycle_candidates.items) |c| {
@@ -17066,6 +18156,20 @@ pub const VM = struct {
         for (self.cycle_array_candidates.items) |c| {
             if (c.elements_released) continue;
             self.cycleVisitArr(c, &visited_objs, &visited_arrs);
+        }
+
+        for (self.cycle_closures.keys()) |owner| {
+            const range = self.capture_index.get(owner.bytes) orelse continue;
+            for (self.captures.items[range.start..][0..range.len]) |capture| {
+                self.cycleDecChild(capture.value, &visited_objs, &visited_arrs);
+                if (capture.ref_cell) |cell| cellOf(cell).scratch -= 1;
+            }
+            if (range.has_statics) {
+                var statics = self.statics_cells.iterator();
+                while (statics.next()) |entry| {
+                    if (closureOwnsStatic(owner.bytes, entry.key_ptr.*)) cellOf(entry.value_ptr.*).scratch -= 1;
+                }
+            }
         }
 
         // pass 2: walk every visited node, decrement child scratch_rc for
@@ -17110,6 +18214,30 @@ pub const VM = struct {
                     if (self.cycleMarkAliveChild(cell.value, &visited_objs, &visited_arrs)) changed = true;
                 }
             }
+            for (self.cycle_closures.keys(), self.cycle_closures.values()) |owner, scratch| {
+                if (scratch == 0) continue;
+                const range = self.capture_index.get(owner.bytes) orelse continue;
+                for (self.captures.items[range.start..][0..range.len]) |capture| {
+                    if (self.cycleMarkAliveChild(capture.value, &visited_objs, &visited_arrs)) changed = true;
+                    if (capture.ref_cell) |cell| {
+                        if (cellOf(cell).scratch == 0) {
+                            cellOf(cell).scratch = 1;
+                            changed = true;
+                        }
+                    }
+                }
+                if (range.has_statics) {
+                    var statics = self.statics_cells.iterator();
+                    while (statics.next()) |entry| {
+                        if (!closureOwnsStatic(owner.bytes, entry.key_ptr.*)) continue;
+                        const cell = cellOf(entry.value_ptr.*);
+                        if (cell.scratch == 0) {
+                            cell.scratch = 1;
+                            changed = true;
+                        }
+                    }
+                }
+            }
             var it = visited_objs.iterator();
             while (it.next()) |kv| {
                 const obj = kv.key_ptr.*;
@@ -17151,8 +18279,38 @@ pub const VM = struct {
                 collected += 1;
             }
         }
+        // Pin dead closures while breaking their outgoing edges. Their names
+        // still occur in cells/containers being drained; forcing string RC to
+        // zero would make those ordinary releases underflow or use freed owners.
+        for (self.cycle_closures.keys(), self.cycle_closures.values()) |owner, scratch| {
+            if (scratch == 0) owner.refcount += 1;
+        }
+        for (self.cycle_closures.keys(), self.cycle_closures.values()) |owner, scratch| {
+            if (scratch != 0) continue;
+            const range = self.capture_index.get(owner.bytes) orelse continue;
+            for (self.captures.items[range.start..][0..range.len]) |*capture| {
+                const value = capture.value;
+                const cell = capture.ref_cell;
+                capture.value = .null;
+                capture.ref_cell = null;
+                self.releaseValue(value);
+                if (cell) |c| self.unbindCell(c);
+            }
+            if (range.ref_owner != 0) if (self.ref_index) |ri| ri.releaseOwner(self.allocator, range.ref_owner);
+            if (range.has_statics) self.purgeClosureStatics(owner.bytes);
+            if (self.capture_index.getPtr(owner.bytes)) |live_range| {
+                live_range.ref_owner = 0;
+                live_range.has_statics = false;
+            }
+        }
+        for (self.cycle_candidates.items) |obj| obj.cycle_queued = false;
+        for (self.cycle_array_candidates.items) |arr| arr.cycle_queued = false;
         self.cycle_candidates.clearRetainingCapacity();
         self.cycle_array_candidates.clearRetainingCapacity();
+        self.drainPendingDestruct();
+        for (self.cycle_closures.keys(), self.cycle_closures.values()) |owner, scratch| {
+            if (scratch == 0) self.releaseClosureByName(owner.bytes);
+        }
         self.drainPendingDestruct();
         self.gc_collected += collected;
         if (self.debug_gc_verify) {
@@ -17243,7 +18401,8 @@ pub const VM = struct {
             };
             var pit = obj.properties.iterator();
             while (pit.next()) |e| if (gcTargetMatches(t, e.value_ptr.*)) gcNote(&c, in_graph, "object {s}#{d} rc {d} scratch {d} prop {s}", .{ obj.class_name, obj.id, obj.refcount, obj.scratch_rc, e.key_ptr.* });
-            if (gcTargetMatches(t, obj.lazy_initializer)) gcNote(&c, in_graph, "object {s}#{d} lazy_initializer", .{ obj.class_name, obj.id });
+            if (gcTargetMatches(t, obj.backingValue())) gcNote(&c, in_graph, "object {s}#{d} lazy_backing", .{ obj.class_name, obj.id });
+            if (gcTargetMatches(t, obj.lazyInitializer())) gcNote(&c, in_graph, "object {s}#{d} lazy_initializer", .{ obj.class_name, obj.id });
         }
         const rc: u32 = switch (t) {
             .obj => |o| o.refcount,
@@ -17503,7 +18662,7 @@ pub const VM = struct {
         }
     }
 
-    fn collectCyclesIfNeeded(self: *VM) void {
+    inline fn collectCyclesIfNeeded(self: *VM) void {
         if (!self.gc_enabled) return;
         const roots = self.cycle_candidates.items.len + self.cycle_array_candidates.items.len;
         if (roots >= self.gc_threshold) _ = self.collectCycles();
@@ -17513,6 +18672,8 @@ pub const VM = struct {
         if (vo.contains(obj)) return;
         vo.put(self.allocator, obj, {}) catch return;
         obj.scratch_rc = @intCast(obj.refcount);
+        self.cycleVisitChild(obj.lazyInitializer(), vo, va);
+        self.cycleVisitChild(obj.backingValue(), vo, va);
         if (obj.slots) |s| {
             for (s) |v| self.cycleVisitChild(v, vo, va);
         }
@@ -17538,8 +18699,41 @@ pub const VM = struct {
         }
     }
 
+    fn closureOwnsStatic(name: []const u8, key: []const u8) bool {
+        return key.len > name.len + 2 and std.mem.startsWith(u8, key, name) and key[name.len] == ':' and key[name.len + 1] == ':';
+    }
+
     fn cycleVisitChild(self: *VM, v: Value, vo: anytype, va: anytype) void {
         switch (v) {
+            .string => |string| {
+                const owner = string.owner orelse return;
+                if (!owner.closure or self.cycle_closures.contains(owner)) return;
+                const range = self.capture_index.get(owner.bytes) orelse return;
+                self.cycle_closures.put(self.allocator, owner, @intCast(owner.refcount)) catch return;
+                for (self.captures.items[range.start..][0..range.len]) |capture| {
+                    self.cycleVisitChild(capture.value, vo, va);
+                    if (capture.ref_cell) |value| {
+                        const cell = cellOf(value);
+                        if (!cell.visited) {
+                            cell.visited = true;
+                            cell.scratch = @intCast(cell.binders);
+                            self.cycleVisitChild(cell.value, vo, va);
+                        }
+                    }
+                }
+                if (range.has_statics) {
+                    var statics = self.statics_cells.iterator();
+                    while (statics.next()) |entry| {
+                        if (!closureOwnsStatic(owner.bytes, entry.key_ptr.*)) continue;
+                        const cell = cellOf(entry.value_ptr.*);
+                        if (!cell.visited) {
+                            cell.visited = true;
+                            cell.scratch = @intCast(cell.binders);
+                            self.cycleVisitChild(cell.value, vo, va);
+                        }
+                    }
+                }
+            },
             .object => |o| self.cycleVisit(o, vo, va),
             .array => |a| self.cycleVisitArr(a, vo, va),
             else => {},
@@ -17547,6 +18741,8 @@ pub const VM = struct {
     }
 
     fn cycleDecrementChildren(self: *VM, obj: *PhpObject, vo: anytype, va: anytype) void {
+        self.cycleDecChild(obj.lazyInitializer(), vo, va);
+        self.cycleDecChild(obj.backingValue(), vo, va);
         if (obj.slots) |s| {
             for (s) |v| self.cycleDecChild(v, vo, va);
         }
@@ -17570,8 +18766,11 @@ pub const VM = struct {
         }
     }
 
-    fn cycleDecChild(_: *VM, v: Value, vo: anytype, va: anytype) void {
+    fn cycleDecChild(self: *VM, v: Value, vo: anytype, va: anytype) void {
         switch (v) {
+            .string => |string| if (string.owner) |owner| {
+                if (self.cycle_closures.getPtr(owner)) |scratch| scratch.* -= 1;
+            },
             .object => |o| if (vo.contains(o)) {
                 o.scratch_rc -= 1;
             },
@@ -17583,7 +18782,8 @@ pub const VM = struct {
     }
 
     fn cycleMarkAlive(self: *VM, obj: *PhpObject, vo: anytype, va: anytype) bool {
-        var changed = false;
+        var changed = self.cycleMarkAliveChild(obj.lazyInitializer(), vo, va);
+        changed = self.cycleMarkAliveChild(obj.backingValue(), vo, va) or changed;
         if (obj.slots) |s| {
             for (s) |v| if (self.cycleMarkAliveChild(v, vo, va)) {
                 changed = true;
@@ -17612,8 +18812,16 @@ pub const VM = struct {
         return changed;
     }
 
-    fn cycleMarkAliveChild(_: *VM, v: Value, vo: anytype, va: anytype) bool {
+    fn cycleMarkAliveChild(self: *VM, v: Value, vo: anytype, va: anytype) bool {
         switch (v) {
+            .string => |string| if (string.owner) |owner| {
+                if (self.cycle_closures.getPtr(owner)) |scratch| {
+                    if (scratch.* == 0) {
+                        scratch.* = 1;
+                        return true;
+                    }
+                }
+            },
             .object => |o| {
                 if (vo.contains(o) and o.scratch_rc == 0) {
                     o.scratch_rc = 1;
@@ -17690,6 +18898,7 @@ pub const VM = struct {
     // object elements reach refcount 0 and get __destruct'd, and nested
     // arrays cascade. clearing prevents any later walk from double-releasing
     fn releaseArrayElements(self: *VM, arr: *PhpArray) void {
+        self.clearArgArraySources(arr);
         for (arr.entries.items) |*e| {
             if (!arr.weak) self.releaseValue(e.value);
             e.value = .null;
@@ -17720,8 +18929,9 @@ pub const VM = struct {
         if (arr.refcount == 0) return;
         arr.refcount -= 1;
         if (arr.refcount != 0) {
-            if (!arr.elements_released) {
-                self.cycle_array_candidates.append(self.allocator, arr) catch {};
+            if (!arr.elements_released and !arr.cycle_queued) {
+                self.cycle_array_candidates.append(self.allocator, arr) catch return;
+                arr.cycle_queued = true;
             }
             return;
         }
@@ -17743,7 +18953,7 @@ pub const VM = struct {
     // the statement-boundary gate. every queue triggers it; in-transit values
     // that cross PHP execution (yield_from handoffs, returns) are pinned by
     // their opcodes rather than protected by a narrower gate
-    pub fn hasPendingReleases(self: *VM) bool {
+    pub inline fn hasPendingReleases(self: *VM) bool {
         return self.pending_destruct.items.len > 0 or
             self.pending_string_release.items.len > 0 or
             self.pending_array_release.items.len > 0 or
@@ -17755,9 +18965,30 @@ pub const VM = struct {
     // slots, so a destructed object's children become unreachable (Stage 1).
     // clearing prevents any later sweep from double-releasing
     fn releaseObjectProperties(self: *VM, obj: *PhpObject) void {
-        if (obj.lazy_initializer != .null) {
-            self.releaseValue(obj.lazy_initializer);
-            obj.lazy_initializer = .null;
+        // detach weak property mirrors before this address can be pooled
+        if (obj.ref_mirrored) if (self.ref_index) |ri| {
+            while (true) {
+                var found: ?RefIndex.OwnedBinding = null;
+                var it = ri.fwd.iterator();
+                outer: while (it.next()) |entry| {
+                    for (entry.value_ptr.items) |target| {
+                        if (target == .object and target.object.object == obj) {
+                            found = .{ .cell = entry.key_ptr.*, .target = target };
+                            break :outer;
+                        }
+                    }
+                }
+                const binding = found orelse break;
+                ri.removeTargetAllOwners(self.allocator, binding.cell, binding.target);
+            }
+        };
+        if (obj.backingValue() != .null) {
+            self.releaseValue(obj.backingValue());
+            obj.lazy.?.backing = null;
+        }
+        if (obj.lazyInitializer() != .null) {
+            self.releaseValue(obj.lazyInitializer());
+            obj.lazy.?.initializer = .null;
         }
         if (obj.slots) |s| {
             for (s) |*v| {
@@ -17786,6 +19017,20 @@ pub const VM = struct {
     // both refcounted (arrays: refcounting Stage 2)
     // container stores release what they replace through the release hook;
     // these remain the named VM-aware store entry points
+    fn detachArrayEntryRef(self: *VM, array: *PhpArray, key: PhpArray.Key) void {
+        const entry = array.getPtr(key) orelse return;
+        const cell = entry.ref orelse return;
+        if (self.ref_index) |ri| ri.removeTargetAllOwners(self.allocator, cell, .{ .array = .{ .array = array, .key = entry.key } });
+        var i: usize = 0;
+        while (i < self.array_ref_bindings.items.len) {
+            const binding = self.array_ref_bindings.items[i];
+            if (binding.array == array and binding.key.eql(entry.key)) {
+                _ = self.array_ref_bindings.swapRemove(i);
+            } else i += 1;
+        }
+        self.setEntryRef(entry, null);
+    }
+
     pub fn arraySetOwned(self: *VM, array: *PhpArray, key: PhpArray.Key, value: Value) !void {
         try array.set(self.allocator, key, value);
         if (array == self.globals_array and key == .string) {
@@ -17818,11 +19063,21 @@ pub const VM = struct {
     }
 
     pub fn objectSetOwned(self: *VM, object: *PhpObject, name: []const u8, value: Value) !void {
-        try object.set(self.allocator, name, value);
+        var stable_name = name;
+        if (object.getSlotIndex(name) == null and !object.storage().properties.contains(name)) {
+            stable_name = try self.allocator.dupe(u8, name);
+            try self.strings.append(self.allocator, stable_name);
+        }
+        try object.set(self.allocator, stable_name, value);
     }
 
     pub fn objectSetForScopeOwned(self: *VM, object: *PhpObject, name: []const u8, value: Value, scope: ?[]const u8) !void {
-        try object.setForScope(self.allocator, name, value, scope);
+        var stable_name = name;
+        if (object.getSlotIndexForScope(name, scope) == null and !object.storage().properties.contains(name)) {
+            stable_name = try self.allocator.dupe(u8, name);
+            try self.strings.append(self.allocator, stable_name);
+        }
+        try object.setForScope(self.allocator, stable_name, value, scope);
     }
 
     pub inline fn retainValue(v: Value) void {

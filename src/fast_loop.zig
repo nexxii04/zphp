@@ -83,10 +83,24 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                         locals[slot] = val;
                     }
                     self.releaseValue(sl_old);
+                    if (frame.vars.count() > 0) {
+                        if (frame.func) |func| {
+                            if (slot < func.slot_names.len) {
+                                if (frame.vars.getPtr(func.slot_names[slot])) |mirror| mirror.* = locals[slot];
+                            }
+                        }
+                    }
                     if (code[ip] == @intFromEnum(OpCode.pop)) {
                         ip += 1;
                         sp -= 1;
                         self.stackRelease(val);
+                        // the fused pop is still a statement boundary: free
+                        // the temporaries this statement dropped, as .pop does
+                        if (self.hasPendingReleases()) {
+                            self.sp = sp;
+                            self.drainPendingDestruct();
+                            sp = self.sp;
+                        }
                     }
                     const _next = code[ip];
                     ip += 1;
@@ -334,6 +348,11 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                         ip += 1;
                         sp -= 1;
                         self.stackRelease(self.stack[sp]);
+                        if (self.hasPendingReleases()) {
+                            self.sp = sp;
+                            self.drainPendingDestruct();
+                            sp = self.sp;
+                        }
                     }
                     const _next = code[ip];
                     ip += 1;
@@ -348,6 +367,11 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                         ip += 1;
                         sp -= 1;
                         self.stackRelease(self.stack[sp]);
+                        if (self.hasPendingReleases()) {
+                            self.sp = sp;
+                            self.drainPendingDestruct();
+                            sp = self.sp;
+                        }
                     }
                     const _next = code[ip];
                     ip += 1;
@@ -685,6 +709,8 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                         self.sp = sp;
                         return;
                     }
+                    self.sp = sp;
+                    self.clearArgStackFrom(sp - ci_acn - 1);
                     for (0..ci_acn) |i| {
                         self.stack[sp - ci_acn - 1 + i] = self.stack[sp - ci_acn + i];
                     }
@@ -720,6 +746,7 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                     self.frames[self.frame_count] = .{
                         .chunk = &ci_func.chunk,
                         .ip = 0,
+                        .entry_sp = sp,
                         .vars = .{},
                         .locals = ci_locals,
                         .func = ci_func,
@@ -744,7 +771,7 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                                 const gp_v = s[gp_entry.slot_index];
                                 // a null slot may be an uninitialized typed property
                                 // - bail so runLoop runs the type check
-                                if (gp_v != .null) {
+                                if (gp_v != .null and gp_obj.lazy == null) {
                                     // the receiver slot is replaced by the property
                                     // value: retain the new occupant, release the
                                     // receiver it overwrites (Stage 1)
@@ -877,6 +904,7 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                                 self.frames[self.frame_count] = .{
                                     .chunk = &mc_func.chunk,
                                     .ip = 0,
+                                    .entry_sp = sp,
                                     .vars = .{},
                                     .locals = mc_locals,
                                     .func = mc_func,
@@ -914,7 +942,10 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                             break :blk f;
                         }
                         // try inline native handling for hot builtins
+                        const native_sp = sp;
                         if (inlineNativeCall(self, name, arg_count, &sp)) {
+                            self.sp = native_sp;
+                            self.clearArgStackFrom(native_sp - arg_count);
                             const _next = code[ip];
                             ip += 1;
                             continue :dispatch @as(OpCode, @enumFromInt(_next));
@@ -970,6 +1001,7 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                     self.frames[self.frame_count] = .{
                         .chunk = &func.chunk,
                         .ip = 0,
+                        .entry_sp = sp,
                         .vars = .{},
                         .locals = new_locals,
                         .func = func,
@@ -1007,6 +1039,8 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                     if (ret_string_pin) |s| s.retain();
                     const ret_arr_pin = if (result == .array) result.array else null;
                     if (ret_arr_pin) |a| VM.arrayRetain(a);
+                    self.sp = sp;
+                    self.clearArgStackFrom(frame.entry_sp);
                     if (frame.call_name) |name| self.releaseClosureByName(name);
                     if (locals.len > 0) {
                         // move model (Stage 1): release $this and the parameter
@@ -1039,6 +1073,8 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                         self.sp = sp;
                         return;
                     }
+                    self.sp = sp;
+                    self.clearArgStackFrom(frame.entry_sp);
                     if (frame.call_name) |name| self.releaseClosureByName(name);
                     if (locals.len > 0) {
                         // move model (Stage 1): release $this and parameter locals
@@ -1244,14 +1280,14 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                     if (a == .string and b == .string) {
                         const as = a.string.bytes();
                         const bs = b.string.bytes();
-                        const owned = try self.allocator.alloc(u8, as.len + bs.len);
+                        const owned = try self.stringAllocator().alloc(u8, as.len + bs.len);
                         @memcpy(owned[0..as.len], as);
                         @memcpy(owned[as.len..], bs);
-                        try self.strings.append(self.allocator, owned);
+                        const result = try Value.String.adopt(self.stringAllocator(), owned);
                         self.stackRelease(a);
                         self.stackRelease(b);
                         sp -= 1;
-                        self.stack[sp - 1] = .{ .string = Value.String.borrowed(owned) };
+                        self.stack[sp - 1] = .{ .string = result };
                         const _next = code[ip];
                         ip += 1;
                         continue :dispatch @as(OpCode, @enumFromInt(_next));
@@ -1262,14 +1298,14 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                             self.sp = sp;
                             return;
                         };
-                        const owned = try self.allocator.alloc(u8, a.string.len + bs.len);
+                        const owned = try self.stringAllocator().alloc(u8, a.string.len + bs.len);
                         @memcpy(owned[0..a.string.len], a.string.bytes());
                         @memcpy(owned[a.string.len..], bs);
-                        try self.strings.append(self.allocator, owned);
+                        const result = try Value.String.adopt(self.stringAllocator(), owned);
                         self.stackRelease(a);
                         self.stackRelease(b);
                         sp -= 1;
-                        self.stack[sp - 1] = .{ .string = Value.String.borrowed(owned) };
+                        self.stack[sp - 1] = .{ .string = result };
                         const _next = code[ip];
                         ip += 1;
                         continue :dispatch @as(OpCode, @enumFromInt(_next));
@@ -1280,14 +1316,14 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                             self.sp = sp;
                             return;
                         };
-                        const owned = try self.allocator.alloc(u8, as.len + b.string.len);
+                        const owned = try self.stringAllocator().alloc(u8, as.len + b.string.len);
                         @memcpy(owned[0..as.len], as);
                         @memcpy(owned[as.len..], b.string.bytes());
-                        try self.strings.append(self.allocator, owned);
+                        const result = try Value.String.adopt(self.stringAllocator(), owned);
                         self.stackRelease(a);
                         self.stackRelease(b);
                         sp -= 1;
-                        self.stack[sp - 1] = .{ .string = Value.String.borrowed(owned) };
+                        self.stack[sp - 1] = .{ .string = result };
                         const _next = code[ip];
                         ip += 1;
                         continue :dispatch @as(OpCode, @enumFromInt(_next));
@@ -1296,6 +1332,56 @@ fn fastLoopImpl(self: *VM) RuntimeError!void {
                         self.sp = sp;
                         return;
                     }
+                },
+                .arg_variable => {
+                    const idx = (@as(u16, code[ip]) << 8) | code[ip + 1];
+                    const field = ip + 2;
+                    const delta = (@as(u16, code[ip + 2]) << 8) | code[ip + 3];
+                    const pos = code[ip + 4];
+                    self.sp = sp;
+                    const capture = self.argCaptureCached(frame.chunk, field, delta, pos, 1) orelse {
+                        frame.ip = ip - 1;
+                        return;
+                    };
+                    ip += 5;
+                    if (capture) self.setArgSource(sp - 1, .{ .simple = consts[idx].string.bytes() });
+                    const next = code[ip];
+                    ip += 1;
+                    continue :dispatch @as(OpCode, @enumFromInt(next));
+                },
+                // by value: the plain fetch that follows runs here untouched.
+                // capture: runLoop re-executes the guard and the fetch. `byte`
+                // is the first opcode of this dispatch chain, not the current
+                // one, so the operand count is fixed per arm
+                .arg_guard_prop => {
+                    const field = ip;
+                    const delta = (@as(u16, code[ip]) << 8) | code[ip + 1];
+                    const pos = code[ip + 2];
+                    self.sp = sp;
+                    const capture = self.argCaptureCached(frame.chunk, field, delta, pos, 1) orelse true;
+                    if (capture) {
+                        frame.ip = ip - 1;
+                        return;
+                    }
+                    ip += 3;
+                    const next = code[ip];
+                    ip += 1;
+                    continue :dispatch @as(OpCode, @enumFromInt(next));
+                },
+                .arg_guard_prop_dynamic, .arg_guard_dim => {
+                    const field = ip;
+                    const delta = (@as(u16, code[ip]) << 8) | code[ip + 1];
+                    const pos = code[ip + 2];
+                    self.sp = sp;
+                    const capture = self.argCaptureCached(frame.chunk, field, delta, pos, 2) orelse true;
+                    if (capture) {
+                        frame.ip = ip - 1;
+                        return;
+                    }
+                    ip += 3;
+                    const next = code[ip];
+                    ip += 1;
+                    continue :dispatch @as(OpCode, @enumFromInt(next));
                 },
                 else => {
                     frame.ip = ip - 1;

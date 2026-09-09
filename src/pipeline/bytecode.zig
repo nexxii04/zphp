@@ -300,9 +300,34 @@ pub const OpCode = enum(u8) {
     // hoisted at registration time, matching PHP's early binding
     declare_fn,
     array_push_assign,
+    // Stack-name variants: pop property name and object, push fetched value.
+    ensure_array_prop_dynamic,
+    get_prop_coalesce_dynamic,
+
+    // argument guards. each carries the u16 distance from its own delta field
+    // to the call opcode it feeds plus the u8 argument position (0xFF for a
+    // positional spread entry, 0xFE for a named one). the runtime resolves the
+    // callee's by-reference intent for that position; a by-value position is
+    // a no-op and the following plain fetch runs unchanged, anything else
+    // records lvalue provenance for the call
+    arg_variable, // u16 name, u16 delta, u8 pos - after the variable read
+    arg_guard_prop, // u16 delta, u8 pos - before get_prop
+    arg_guard_prop_dynamic, // u16 delta, u8 pos - before get_prop_dynamic
+    arg_guard_dim, // u16 delta, u8 pos - before array_get
+    arg_array_set,
+    arg_array_push,
+    check_prop_dimension, // peek object + property name; guard indirect storage mutation
+
+    // Explicit reference sources use the same owning provenance as arguments.
+    reference_source, // u16 temporary binding name; move cell to a pushed value
+    array_set_elem_ref, // [array, key, source] -> [array], bind entry to source cell
+    array_push_ref, // [array, source] -> [array], append source cell
 
     pub fn width(self: OpCode) usize {
         return switch (self) {
+            .arg_variable => 6,
+            .arg_guard_prop, .arg_guard_prop_dynamic, .arg_guard_dim => 4,
+            .reference_source,
             .constant,
             .get_var,
             .set_var,
@@ -379,6 +404,7 @@ pub const OpCode = enum(u8) {
     pub fn stackEffect(self: OpCode) i8 {
         return switch (self) {
             // push a value
+            .reference_source,
             .constant,
             .op_null,
             .op_true,
@@ -409,6 +435,8 @@ pub const OpCode = enum(u8) {
             .array_get_coalesce,
             .array_get_vivify,
             .get_prop_dynamic,
+            .ensure_array_prop_dynamic,
+            .get_prop_coalesce_dynamic,
             .isset_prop_dynamic,
             .array_elem_inc,
             .array_elem_dec,
@@ -442,9 +470,10 @@ pub const OpCode = enum(u8) {
             // scanCallerArgSources' backward arg-boundary walk whenever an
             // array literal appeared as a call argument
             .array_push,
+            .array_push_ref,
             .array_spread,
             => -1,
-            .array_set_elem => -2,
+            .array_set_elem, .array_set_elem_ref => -2,
             // unary ops: pop 1, push 1
             .negate,
             .bit_not,

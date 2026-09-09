@@ -11,110 +11,16 @@ pub fn compileAssign(self: *Compiler, node: Ast.Node) Error!void {
     const target = self.ast.nodes[node.data.lhs];
     const op_tag = self.ast.tokens[node.main_token].tag;
 
-    // `$dst = &…` — emit break_var_ref so the subsequent value-write doesn't
-    // propagate through a stale prior ref binding on dst. true ref binding
-    // (make_var_ref, make_var_array_elem_ref) is defined in the runtime but
-    // not emitted from the compiler yet — enabling it makes correct PHP
-    // semantics for `$b = &$a` but exposes a downstream zphp bug where
-    // Laravel's Route registration loses the /api prefix on POST routes
-    // (the Arr::except → Arr::forget chain run during Route::__construct
-    // triggers the divergence). break_var_ref alone preserves today's
-    // baseline. see roadmap item #1 for the next push
-    // gated: enabling make_var_ref emission below correctly implements
-    // PHP's `$b = &$a` aliasing in isolation, but during Laravel's route
-    // registration the cumulative effect causes $this->groupStack[last] to
-    // lose its 'prefix' key between Router::mergeWithLastGroup invocations.
-    // bisected to: somewhere inside RouteGroup::merge → Arr::except → forget,
-    // $old (which should be a callLocalsOnly clone of array_last result) gets
-    // mutated AND the mutation propagates to $groupStack[last]. callLocalsOnly
-    // calls copyValue, which calls cloneArrayInner, which deep-clones nested
-    // arrays. yet the source array gets mutated. either there's a clone path
-    // that returns the original pointer, or there's a fast_loop path that
-    // skips the copy. tracking down requires deeper instrumentation of the
-    // call site that produces merge's $old
     if (op_tag == .equal and (target.tag == .variable or target.tag == .identifier)) {
-        const rhs_node = self.ast.nodes[node.data.rhs];
-        if (rhs_node.tag == .ref_target) {
-            const dst_name = self.ast.tokenSlice(target.main_token);
-            const dst_idx = try self.addConstant(.{ .string = Value.String.borrowed(dst_name) });
-            const inner = self.ast.nodes[rhs_node.data.lhs];
-            // when emitting make_var_ref / make_var_array_elem_ref, do NOT
-            // emit break_var_ref first - those opcodes replace dst's ref_slot
-            // atomically, and a prior break_var_ref would drop the slot before
-            // we push the rhs, causing the rhs's get_var to fall back to stale
-            // frame.vars
-            if (inner.tag == .variable or inner.tag == .identifier) {
-                const src_name = self.ast.tokenSlice(inner.main_token);
-                const src_idx = try self.addConstant(.{ .string = Value.String.borrowed(src_name) });
-                try self.emitOp(.make_var_ref);
-                try self.emitU16(dst_idx);
-                try self.emitU16(src_idx);
-                try self.compileNode(rhs_node.data.lhs);
+        const rhs = self.ast.nodes[node.data.rhs];
+        if (rhs.tag == .ref_target) {
+            const dst = try self.addConstant(.{ .string = Value.String.borrowed(self.ast.tokenSlice(target.main_token)) });
+            if (try compileReferenceBinding(self, rhs.data.lhs, dst)) {
+                try self.emitGetVar(self.ast.tokenSlice(target.main_token));
                 return;
             }
-            if (inner.tag == .array_access or inner.tag == .array_push_target) {
-                try self.compileNode(inner.data.lhs); // push array (must read via current ref_slot)
-                if (inner.tag == .array_push_target) {
-                    try self.emitOp(.op_null);
-                } else {
-                    try self.compileNode(inner.data.rhs); // push key
-                }
-                try self.emitOp(.make_var_array_elem_ref);
-                try self.emitU16(dst_idx);
-                try self.emitOp(.op_null);
-                return;
-            }
-            if (inner.tag == .property_access and !self.isDynamicProp(inner)) {
-                try self.compileNode(inner.data.lhs); // push object
-                const prop_idx = try self.addConstant(.{ .string = Value.String.borrowed(self.propName(inner)) });
-                try self.emitOp(.make_var_prop_ref);
-                try self.emitU16(dst_idx);
-                try self.emitU16(prop_idx);
-                try self.emitOp(.op_null);
-                return;
-            }
-            if (inner.tag == .property_access and self.isDynamicProp(inner)) {
-                try self.compileNode(inner.data.lhs); // push object
-                try self.compileNode(inner.data.rhs); // push prop name (variable value)
-                try self.emitOp(.make_var_prop_ref_dyn);
-                try self.emitU16(dst_idx);
-                try self.emitOp(.op_null);
-                return;
-            }
-            if (inner.tag == .static_prop_access) {
-                const class_node = self.ast.nodes[inner.data.lhs];
-                const class_name = resolveNodeClassName(self, class_node) catch {
-                    try self.emitOp(.break_var_ref);
-                    try self.emitU16(dst_idx);
-                    try self.compileNode(rhs_node.data.lhs);
-                    return;
-                };
-                var prop_name = self.ast.tokenSlice(inner.main_token);
-                if (prop_name.len > 0 and prop_name[0] == '$') prop_name = prop_name[1..];
-                const class_idx = try self.addConstant(.{ .string = Value.String.borrowed(class_name) });
-                const prop_idx = try self.addConstant(.{ .string = Value.String.borrowed(prop_name) });
-                try self.emitOp(.make_var_static_prop_ref);
-                try self.emitU16(dst_idx);
-                try self.emitU16(class_idx);
-                try self.emitU16(prop_idx);
-                try self.emitOp(.op_null);
-                return;
-            }
-            if (inner.tag == .call or inner.tag == .method_call) {
-                // `$dst = &foo(...)` or `$dst = &$obj->method(...)` - the
-                // callee may be a ref-returning function. emit the call as a
-                // value (return_ref also pushes the value), then bind_ref_
-                // from_return picks up vm.last_return_ref if set. degrades
-                // to a value copy if the callee wasn't ref-returning
-                try self.compileNode(rhs_node.data.lhs);
-                try self.emitOp(.bind_ref_from_return);
-                try self.emitU16(dst_idx);
-                return;
-            }
-            // fallback for shapes we don't yet bind explicitly (dynamic property,
-            // chained ref-assign)
             try self.emitOp(.break_var_ref);
-            try self.emitU16(dst_idx);
+            try self.emitU16(dst);
         }
     }
 
@@ -226,12 +132,16 @@ pub fn compileAssign(self: *Compiler, node: Ast.Node) Error!void {
                 try self.emitOp(.array_set_chain);
                 return;
             }
-            if (target_lhs.tag == .property_access and !self.isDynamicProp(target_lhs)) {
+            if (target_lhs.tag == .property_access) {
                 try self.compileNode(target_lhs.data.lhs); // push $obj
-                const prop_name = self.propName(target_lhs);
-                const cidx = try self.addConstant(.{ .string = Value.String.borrowed(prop_name) });
-                try self.emitOp(.constant);
-                try self.emitU16(cidx); // push prop name
+                if (self.isDynamicProp(target_lhs)) {
+                    try self.compileNode(target_lhs.data.rhs);
+                } else {
+                    const prop_name = self.propName(target_lhs);
+                    const cidx = try self.addConstant(.{ .string = Value.String.borrowed(prop_name) });
+                    try self.emitOp(.constant);
+                    try self.emitU16(cidx); // push prop name
+                }
                 try self.compileNode(target.data.rhs); // push inner key
                 try self.compileNode(node.data.rhs); // push value
                 try self.emitOp(.prop_set_chain);
@@ -705,17 +615,44 @@ fn compileCoalesceFetch(self: *Compiler, node_idx: u32) Error!void {
         try self.emitOp(.array_get_coalesce);
         return;
     }
-    // a static-name property read under `??` uses isset-semantics: an
+    // A property read under `??` uses isset-semantics: an
     // uninitialized typed property must read as null, not throw. recurse so a
     // chain `$a->b->c ?? x` is non-throwing all the way down
-    if (n.tag == .property_access and !self.isDynamicProp(n)) {
+    if (n.tag == .property_access) {
         try compileCoalesceFetch(self, n.data.lhs);
-        const name_idx = try self.addConstant(.{ .string = Value.String.borrowed(self.propName(n)) });
-        try self.emitOp(.get_prop_coalesce);
-        try self.emitU16(name_idx);
+        if (self.isDynamicProp(n)) {
+            try self.compileNode(n.data.rhs);
+            try self.emitOp(.get_prop_coalesce_dynamic);
+        } else {
+            const name_idx = try self.addConstant(.{ .string = Value.String.borrowed(self.propName(n)) });
+            try self.emitOp(.get_prop_coalesce);
+            try self.emitU16(name_idx);
+        }
         return;
     }
     try self.compileNode(node_idx);
+}
+
+// Descend through dimensions, but stop at object interiors: mutating
+// $o->restricted->field[k] does not mutate $o->restricted itself.
+fn compileUnsetDimensionBase(self: *Compiler, node_idx: u32) Error!void {
+    const node = self.ast.nodes[node_idx];
+    if (node.tag == .array_access) {
+        try compileUnsetDimensionBase(self, node.data.lhs);
+        try self.compileNode(node.data.rhs);
+        try self.emitOp(.array_get_coalesce);
+    } else if (node.tag == .property_access) {
+        try self.compileNode(node.data.lhs);
+        if (self.isDynamicProp(node)) {
+            try self.compileNode(node.data.rhs);
+        } else {
+            try self.emitConstant(try self.addConstant(.{ .string = Value.String.borrowed(self.propName(node)) }));
+        }
+        try self.emitOp(.check_prop_dimension);
+        try self.emitOp(.get_prop_coalesce_dynamic);
+    } else {
+        try compileCoalesceFetch(self, node_idx);
+    }
 }
 
 pub fn compileTernary(self: *Compiler, node: Ast.Node) Error!void {
@@ -752,39 +689,80 @@ fn cowByRefArg0(name: []const u8) bool {
     return @import("../stdlib/byref_args.zig").arg0IsByRef(name);
 }
 
-fn compileCallArg(self: *Compiler, fn_name: []const u8, pos: usize, arg_idx: u32) Error!void {
-    if (pos == 0 and cowByRefArg0(fn_name)) {
-        const arg = self.ast.nodes[arg_idx];
-        if (arg.tag == .variable) {
-            // separate-in-place if it holds a shared array, then load normally.
-            // non-throwing: a non-array arg passes through so the native raises
-            // its own "must be of type array" TypeError
-            const name = self.ast.tokenSlice(arg.main_token);
-            if (Compiler.isSuperglobal(name)) {
-                try self.emitOp(.ensure_array_var);
-                try self.emitU16(try self.addConstant(.{ .string = Value.String.borrowed(name) }));
-                try self.emitByte(1);
-            }
-            var slot_opt: ?u16 = null;
-            if (self.local_slots.get(name)) |s| {
-                slot_opt = s;
-            } else if (self.arrowCaptureSlot(name)) |s| {
-                slot_opt = s;
-            } else if (!Compiler.isSuperglobal(name) and !self.inFunctionScope() and name.len > 0 and name[0] == '$') {
-                slot_opt = self.getOrCreateSlot(name);
-            }
-            if (slot_opt) |slot| {
-                try self.emitOp(.cow_separate_local);
-                try self.emitU16(slot);
-                try self.compileNode(arg_idx);
-                return;
-            }
-        } else if (arg.tag == .array_access) {
-            try compileVivifyChain(self, arg_idx);
-            return;
-        }
+// an lvalue argument (variable, property or dimension chain) is lowered as
+// its ordinary read preceded by a guard that names the call it feeds. the
+// runtime resolves the callee's by-reference intent for that position before
+// the read runs: by value leaves the read untouched, otherwise the read
+// records provenance the call binds from. the call opcode is not placed until
+// every argument is emitted, so the guards' delta fields are patched afterwards
+pub const ArgGuards = std.ArrayListUnmanaged(u32);
+
+pub const ArgPos = struct {
+    pub const spread: u8 = 0xFF;
+    pub const named: u8 = 0xFE;
+    pub const max: u8 = 0xFD;
+};
+
+const ArgGuard = struct { pos: u8, guards: *ArgGuards };
+
+fn emitArgGuard(self: *Compiler, guard: ArgGuard, op: OpCode) Error!void {
+    try self.emitOp(op);
+    try guard.guards.append(self.allocator, @intCast(self.chunk.offset()));
+    try self.emitU16(0);
+    try self.emitByte(guard.pos);
+}
+
+fn patchArgGuards(self: *Compiler, guards: *ArgGuards, call_ip: usize) void {
+    for (guards.items) |field| {
+        const delta = call_ip - field;
+        if (delta > 0xFFFF) continue;
+        self.chunk.code.items[field] = @intCast(delta >> 8);
+        self.chunk.code.items[field + 1] = @intCast(delta & 0xff);
     }
-    try self.compileNode(arg_idx);
+    guards.deinit(self.allocator);
+}
+
+const CallOperands = struct { a: ?u16 = null, b: ?u16 = null, argc: ?u8 = null };
+
+fn emitCallOp(self: *Compiler, guards: *ArgGuards, op: OpCode, operands: CallOperands) Error!void {
+    const call_ip = self.chunk.offset();
+    try self.emitOp(op);
+    if (operands.a) |a| try self.emitU16(a);
+    if (operands.b) |b| try self.emitU16(b);
+    if (operands.argc) |argc| try self.emitByte(argc);
+    patchArgGuards(self, guards, call_ip);
+}
+
+fn compileArgLvalue(self: *Compiler, arg_idx: u32, guard: ArgGuard) Error!void {
+    const arg = self.ast.nodes[arg_idx];
+    switch (arg.tag) {
+        .property_access => try compilePropertyFetch(self, arg, guard),
+        .array_access => {
+            try compileArgLvalue(self, arg.data.lhs, guard);
+            try self.compileNode(arg.data.rhs);
+            try emitArgGuard(self, guard, .arg_guard_dim);
+            try self.emitOp(.array_get);
+        },
+        .variable => {
+            try self.compileNode(arg_idx);
+            try self.emitOp(.arg_variable);
+            try self.emitU16(try self.addConstant(.{ .string = Value.String.borrowed(self.ast.tokenSlice(arg.main_token)) }));
+            try guard.guards.append(self.allocator, @intCast(self.chunk.offset()));
+            try self.emitU16(0);
+            try self.emitByte(guard.pos);
+        },
+        else => try self.compileNode(arg_idx),
+    }
+}
+
+fn compileArgs(self: *Compiler, args: []const u32) Error!ArgGuards {
+    var guards: ArgGuards = .{};
+    errdefer guards.deinit(self.allocator);
+    for (args, 0..) |arg, i| {
+        const pos: u8 = if (i <= ArgPos.max) @intCast(i) else ArgPos.spread;
+        try compileArgLvalue(self, arg, .{ .pos = pos, .guards = &guards });
+    }
+    return guards;
 }
 
 pub fn compileCall(self: *Compiler, node: Ast.Node) Error!void {
@@ -837,38 +815,11 @@ pub fn compileCall(self: *Compiler, node: Ast.Node) Error!void {
                         try self.emitU16(prop_idx);
                     }
                 } else if (arg.tag == .array_access) {
-                    const lhs_node = self.ast.nodes[arg.data.lhs];
-                    if (lhs_node.tag == .property_access and !self.isDynamicProp(lhs_node)) {
-                        // for isset($obj->prop[key]), PHP first calls __isset('prop')
-                        // and short-circuits to false without calling __get when the
-                        // property isn't set. emit: obj, dup, isset_prop, branch on
-                        // false (drop the obj, push false), else get_prop and isset_index
-                        try self.compileNode(lhs_node.data.lhs);
-                        try self.emitOp(.dup);
-                        const prop_name = self.propName(lhs_node);
-                        const prop_idx = try self.addConstant(.{ .string = Value.String.borrowed(prop_name) });
-                        try self.emitOp(.isset_prop);
-                        try self.emitU16(prop_idx);
-                        // stack: [obj, bool]
-                        const false_jump = try self.emitJump(.jump_if_false);
-                        try self.emitOp(.pop); // drop true bool → [obj]
-                        try self.emitOp(.get_prop);
-                        try self.emitU16(prop_idx);
-                        try self.compileNode(arg.data.rhs);
-                        try self.emitOp(.isset_index); // → [bool]
-                        const done_jump = try self.emitJump(.jump);
-                        self.patchJump(false_jump);
-                        // stack: [obj, false] — swap and drop obj to leave [false]
-                        try self.emitOp(.swap);
-                        try self.emitOp(.pop);
-                        self.patchJump(done_jump);
-                    } else {
-                        // use coalesce fetch for the LHS chain so nested
-                        // isset($a[x][y]) doesn't warn on the inner read
-                        try compileCoalesceFetch(self, arg.data.lhs);
-                        try self.compileNode(arg.data.rhs);
-                        try self.emitOp(.isset_index);
-                    }
+                    // Fetch each chain link once: hooks are reads, not a separate
+                    // existence probe followed by another getter invocation.
+                    try compileCoalesceFetch(self, arg.data.lhs);
+                    try self.compileNode(arg.data.rhs);
+                    try self.emitOp(.isset_index);
                 } else {
                     try self.compileNode(arg_idx);
                     try self.emitOp(.op_null);
@@ -895,52 +846,50 @@ pub fn compileCall(self: *Compiler, node: Ast.Node) Error!void {
                 const var_name = self.ast.tokenSlice(prop_node.main_token);
                 try self.emitGetVar(var_name);
             }
-            try emitSpreadArgs(self, args);
-            try self.emitOp(.method_call_dynamic_spread);
-        } else {
-            try emitSpreadArgs(self, args);
-            if (callee.tag == .identifier) {
-                const raw_name = self.ast.tokenSlice(callee.main_token);
-                const name = self.resolveFunctionName(raw_name);
-                const idx = try self.addConstant(.{ .string = Value.String.borrowed(name) });
-                try self.emitOp(.call_spread);
-                try self.emitU16(idx);
-            } else if (callee.tag == .qualified_name) {
-                const parts = self.ast.extraSlice(callee.data.lhs);
-                const fqn = try self.buildQualifiedString(parts);
-                const name = if (fqn.len > 0 and fqn[0] == '\\') fqn[1..] else fqn;
-                const idx = try self.addConstant(.{ .string = Value.String.borrowed(name) });
-                try self.emitOp(.call_spread);
-                try self.emitU16(idx);
-            } else if (callee.tag == .static_prop_access and callee.main_token != 0 and self.ast.tokens[callee.main_token].tag == .variable) {
-                const class_node = self.ast.nodes[callee.data.lhs];
-                const var_name = self.ast.tokenSlice(callee.main_token);
-                if (class_node.tag == .variable) {
-                    try self.compileNode(callee.data.lhs);
-                } else {
-                    const class_name = try resolveNodeClassName(self, class_node);
-                    const cn_idx = try self.addConstant(.{ .string = Value.String.borrowed(class_name) });
-                    try self.emitOp(.constant);
-                    try self.emitU16(cn_idx);
-                }
-                try self.emitGetVar(var_name);
-                try emitSpreadArgs(self, args);
-                try self.emitOp(.static_call_dyn_both_spread);
+            var guards = try emitSpreadArgs(self, args);
+            try emitCallOp(self, &guards, .method_call_dynamic_spread, .{});
+        } else if (callee.tag == .identifier) {
+            const raw_name = self.ast.tokenSlice(callee.main_token);
+            const name = self.resolveFunctionName(raw_name);
+            const idx = try self.addConstant(.{ .string = Value.String.borrowed(name) });
+            var guards = try emitSpreadArgs(self, args);
+            try emitCallOp(self, &guards, .call_spread, .{ .a = idx });
+        } else if (callee.tag == .qualified_name) {
+            const parts = self.ast.extraSlice(callee.data.lhs);
+            const fqn = try self.buildQualifiedString(parts);
+            const name = if (fqn.len > 0 and fqn[0] == '\\') fqn[1..] else fqn;
+            const idx = try self.addConstant(.{ .string = Value.String.borrowed(name) });
+            var guards = try emitSpreadArgs(self, args);
+            try emitCallOp(self, &guards, .call_spread, .{ .a = idx });
+        } else if (callee.tag == .static_prop_access and callee.main_token != 0 and self.ast.tokens[callee.main_token].tag == .variable) {
+            const class_node = self.ast.nodes[callee.data.lhs];
+            const var_name = self.ast.tokenSlice(callee.main_token);
+            if (class_node.tag == .variable) {
+                try self.compileNode(callee.data.lhs);
             } else {
-                try self.compileNode(node.data.lhs);
-                try self.emitOp(.call_indirect_spread);
+                const class_name = try resolveNodeClassName(self, class_node);
+                const cn_idx = try self.addConstant(.{ .string = Value.String.borrowed(class_name) });
+                try self.emitOp(.constant);
+                try self.emitU16(cn_idx);
             }
+            try self.emitGetVar(var_name);
+            var guards = try emitSpreadArgs(self, args);
+            try emitCallOp(self, &guards, .static_call_dyn_both_spread, .{});
+        } else {
+            // the callable is evaluated after its argument array, matching
+            // call_indirect_spread's pop order
+            var guards = try emitSpreadArgs(self, args);
+            try self.compileNode(node.data.lhs);
+            try emitCallOp(self, &guards, .call_indirect_spread, .{});
         }
     } else if (callee.tag == .identifier) {
         const call_offset = self.current_source_offset;
         const raw_name = self.ast.tokenSlice(callee.main_token);
         const name = self.resolveFunctionName(raw_name);
-        for (args, 0..) |arg, i| try compileCallArg(self, name, i, arg);
+        var guards = try compileArgs(self, args);
         self.current_source_offset = call_offset;
         const idx = try self.addConstant(.{ .string = Value.String.borrowed(name) });
-        try self.emitOp(.call);
-        try self.emitU16(idx);
-        try self.emitByte(@intCast(args.len));
+        try emitCallOp(self, &guards, .call, .{ .a = idx, .argc = @intCast(args.len) });
     } else if (callee.tag == .qualified_name) {
         const call_offset = self.current_source_offset;
         const parts = self.ast.extraSlice(callee.data.lhs);
@@ -953,15 +902,10 @@ pub fn compileCall(self: *Compiler, node: Ast.Node) Error!void {
             self.string_allocs.append(self.allocator, q) catch return error.CompileError;
             break :blk q;
         } else stripped;
-        // route through compileCallArg so an explicit-global by-ref native call
-        // (`\array_shift($x)`) still gets cow_separate_local - cowByRefArg0
-        // matches on the basename
-        for (args, 0..) |arg, i| try compileCallArg(self, name, i, arg);
+        var guards = try compileArgs(self, args);
         self.current_source_offset = call_offset;
         const idx = try self.addConstant(.{ .string = Value.String.borrowed(name) });
-        try self.emitOp(.call);
-        try self.emitU16(idx);
-        try self.emitByte(@intCast(args.len));
+        try emitCallOp(self, &guards, .call, .{ .a = idx, .argc = @intCast(args.len) });
     } else if (callee.tag == .property_access and self.isDynamicProp(callee)) {
         const call_offset = self.current_source_offset;
         try self.compileNode(callee.data.lhs);
@@ -972,10 +916,9 @@ pub fn compileCall(self: *Compiler, node: Ast.Node) Error!void {
             const var_name = self.ast.tokenSlice(prop_node.main_token);
             try self.emitGetVar(var_name);
         }
-        for (args) |arg| try self.compileNode(arg);
+        var guards = try compileArgs(self, args);
         self.current_source_offset = call_offset;
-        try self.emitOp(.method_call_dynamic);
-        try self.emitByte(@intCast(args.len));
+        try emitCallOp(self, &guards, .method_call_dynamic, .{ .argc = @intCast(args.len) });
     } else if (callee.tag == .static_prop_access and callee.main_token != 0 and self.ast.tokens[callee.main_token].tag == .variable) {
         const call_offset = self.current_source_offset;
         const class_node = self.ast.nodes[callee.data.lhs];
@@ -983,27 +926,23 @@ pub fn compileCall(self: *Compiler, node: Ast.Node) Error!void {
         if (class_node.tag == .variable) {
             try self.compileNode(callee.data.lhs);
             try self.emitGetVar(var_name);
-            for (args) |arg| try self.compileNode(arg);
+            var guards = try compileArgs(self, args);
             self.current_source_offset = call_offset;
-            try self.emitOp(.static_call_dyn_both);
-            try self.emitByte(@intCast(args.len));
+            try emitCallOp(self, &guards, .static_call_dyn_both, .{ .argc = @intCast(args.len) });
         } else {
             const class_name = try resolveNodeClassName(self, class_node);
             const class_idx = try self.addConstant(.{ .string = Value.String.borrowed(class_name) });
             try self.emitGetVar(var_name);
-            for (args) |arg| try self.compileNode(arg);
+            var guards = try compileArgs(self, args);
             self.current_source_offset = call_offset;
-            try self.emitOp(.static_call_dyn_method);
-            try self.emitU16(class_idx);
-            try self.emitByte(@intCast(args.len));
+            try emitCallOp(self, &guards, .static_call_dyn_method, .{ .a = class_idx, .argc = @intCast(args.len) });
         }
     } else {
         const call_offset = self.current_source_offset;
         try self.compileNode(node.data.lhs);
-        for (args) |arg| try self.compileNode(arg);
+        var guards = try compileArgs(self, args);
         self.current_source_offset = call_offset;
-        try self.emitOp(.call_indirect);
-        try self.emitByte(@intCast(args.len));
+        try emitCallOp(self, &guards, .call_indirect, .{ .argc = @intCast(args.len) });
     }
 }
 
@@ -1015,7 +954,9 @@ pub fn hasSplatOrNamed(ast: *const Ast, args: []const u32) bool {
     return false;
 }
 
-pub fn emitSpreadArgs(self: *Compiler, args: []const u32) Error!void {
+pub fn emitSpreadArgs(self: *Compiler, args: []const u32) Error!ArgGuards {
+    var guards: ArgGuards = .{};
+    errdefer guards.deinit(self.allocator);
     try self.emitOp(.array_new);
     for (args) |arg_idx| {
         const arg_node = self.ast.nodes[arg_idx];
@@ -1027,13 +968,18 @@ pub fn emitSpreadArgs(self: *Compiler, args: []const u32) Error!void {
             const name_const = try self.addConstant(.{ .string = Value.String.borrowed(name) });
             try self.emitOp(.constant);
             try self.emitU16(name_const);
-            try self.compileNode(arg_node.data.lhs);
-            try self.emitOp(.array_set_elem);
+            try compileArgLvalue(self, arg_node.data.lhs, .{ .pos = ArgPos.named, .guards = &guards });
+            try self.emitOp(.arg_array_set);
         } else {
-            try self.compileNode(arg_idx);
-            try self.emitOp(.array_push);
+            try compileArgLvalue(self, arg_idx, .{ .pos = ArgPos.spread, .guards = &guards });
+            try self.emitOp(.arg_array_push);
         }
     }
+    return guards;
+}
+
+pub fn emitSpreadCallOp(self: *Compiler, guards: *ArgGuards, op: OpCode, a: ?u16, argc: ?u8) Error!void {
+    try emitCallOp(self, guards, op, .{ .a = a, .argc = argc });
 }
 
 fn compileUnset(self: *Compiler, args: []const u32) Error!void {
@@ -1087,7 +1033,7 @@ fn compileUnset(self: *Compiler, args: []const u32) Error!void {
             }
             // for `unset($a[k1][k2]...[kn])`, the intermediate reads should
             // use coalesce-safe semantics so missing keys don't warn
-            try compileCoalesceFetch(self, arg.data.lhs);
+            try compileUnsetDimensionBase(self, arg.data.lhs);
             try self.compileNode(arg.data.rhs);
             try self.emitOp(.unset_array_elem);
         }
@@ -1171,13 +1117,18 @@ pub fn compileVivifyChain(self: *Compiler, node_idx: u32) Error!void {
     } else if (node.tag == .variable or node.tag == .identifier) {
         const name = self.ast.tokenSlice(node.main_token);
         try emitEnsureArray(self, name);
-    } else if (node.tag == .property_access and !self.isDynamicProp(node)) {
+    } else if (node.tag == .property_access) {
         // $obj->prop[]=x / $obj->prop[k] op= v: load the property array for
         // in-place write with COW separation + write-back (ensure_array_prop)
         try self.compileNode(node.data.lhs);
-        const prop_idx = try self.addConstant(.{ .string = Value.String.borrowed(self.propName(node)) });
-        try self.emitOp(.ensure_array_prop);
-        try self.emitU16(prop_idx);
+        if (self.isDynamicProp(node)) {
+            try self.compileNode(node.data.rhs);
+            try self.emitOp(.ensure_array_prop_dynamic);
+        } else {
+            const prop_idx = try self.addConstant(.{ .string = Value.String.borrowed(self.propName(node)) });
+            try self.emitOp(.ensure_array_prop);
+            try self.emitU16(prop_idx);
+        }
     } else if (node.tag == .static_prop_access and self.ast.nodes[node.data.lhs].tag != .variable) {
         // Class::$prop[]=x: load the static-prop array for in-place write with
         // COW separation + write-back (ensure_array_static_prop). dynamic
@@ -1225,6 +1176,63 @@ fn emitEnsureArray(self: *Compiler, name: []const u8) Error!void {
     try self.emitByte(0);
 }
 
+// Bind a source lvalue without leaving an evaluated value on the stack.
+// Assignments, reference returns, and literal entries use the same machinery.
+pub fn compileReferenceBinding(self: *Compiler, source: u32, dst: u16) Error!bool {
+    const node = self.ast.nodes[source];
+    switch (node.tag) {
+        .variable, .identifier => {
+            try self.emitOp(.make_var_ref);
+            try self.emitU16(dst);
+            try self.emitU16(try self.addConstant(.{ .string = Value.String.borrowed(self.ast.tokenSlice(node.main_token)) }));
+        },
+        .array_access, .array_push_target => {
+            try compileVivifyChain(self, node.data.lhs);
+            if (node.tag == .array_push_target) try self.emitOp(.op_null) else try self.compileNode(node.data.rhs);
+            try self.emitOp(.make_var_array_elem_ref);
+            try self.emitU16(dst);
+        },
+        .property_access => {
+            try self.compileNode(node.data.lhs);
+            if (self.isDynamicProp(node)) {
+                try self.compileNode(node.data.rhs);
+                try self.emitOp(.make_var_prop_ref_dyn);
+                try self.emitU16(dst);
+            } else {
+                try self.emitOp(.make_var_prop_ref);
+                try self.emitU16(dst);
+                try self.emitU16(try self.addConstant(.{ .string = Value.String.borrowed(self.propName(node)) }));
+            }
+        },
+        .static_prop_access => {
+            const class_name = resolveNodeClassName(self, self.ast.nodes[node.data.lhs]) catch return false;
+            var prop_name = self.ast.tokenSlice(node.main_token);
+            if (prop_name.len > 0 and prop_name[0] == '$') prop_name = prop_name[1..];
+            try self.emitOp(.make_var_static_prop_ref);
+            try self.emitU16(dst);
+            try self.emitU16(try self.addConstant(.{ .string = Value.String.borrowed(class_name) }));
+            try self.emitU16(try self.addConstant(.{ .string = Value.String.borrowed(prop_name) }));
+        },
+        .call, .method_call, .static_call => {
+            try self.compileNode(source);
+            try self.emitOp(.bind_ref_from_return);
+            try self.emitU16(dst);
+            try self.emitOp(.pop);
+        },
+        else => return false,
+    }
+    return true;
+}
+
+// Move the temporary binding into the owning operand-stack provenance. No
+// synthetic variable survives the expression or holds a returned local alive.
+fn compileReferenceSource(self: *Compiler, source: u32) Error!void {
+    const dst = try self.addConstant(.{ .string = Value.String.borrowed("\x00reference-source") });
+    if (!try compileReferenceBinding(self, source, dst)) return error.CompileError;
+    try self.emitOp(.reference_source);
+    try self.emitU16(dst);
+}
+
 pub fn compileArrayLiteral(self: *Compiler, node: Ast.Node) Error!void {
     try self.emitOp(.array_new);
     for (self.ast.extraSlice(node.data.lhs)) |elem_idx| {
@@ -1232,29 +1240,25 @@ pub fn compileArrayLiteral(self: *Compiler, node: Ast.Node) Error!void {
         if (elem.tag == .array_spread) {
             try self.compileNode(elem.data.lhs);
             try self.emitOp(.array_spread);
-        } else if (elem.data.rhs != 0) {
-            try self.compileNode(elem.data.rhs);
-            try self.compileNode(elem.data.lhs);
-            try self.emitOp(.array_set_elem);
+            continue;
+        }
+        const value = self.ast.nodes[elem.data.lhs];
+        if (elem.data.rhs != 0) try self.compileNode(elem.data.rhs);
+        if (value.tag == .ref_target) {
+            try compileReferenceSource(self, value.data.lhs);
+            try self.emitOp(if (elem.data.rhs != 0) .array_set_elem_ref else .array_push_ref);
         } else {
-            const value_node = self.ast.nodes[elem.data.lhs];
-            if (value_node.tag == .ref_target) {
-                const ref_inner = self.ast.nodes[value_node.data.lhs];
-                if (ref_inner.tag == .variable) {
-                    try self.emitOp(.dup);
-                    try self.emitOp(.array_push_bind_ref);
-                    try self.emitU16(try self.addConstant(.{ .string = Value.String.borrowed(self.ast.tokenSlice(ref_inner.main_token)) }));
-                    try self.emitOp(.pop);
-                    continue;
-                }
-            }
             try self.compileNode(elem.data.lhs);
-            try self.emitOp(.array_push);
+            try self.emitOp(if (elem.data.rhs != 0) .array_set_elem else .array_push);
         }
     }
 }
 
 pub fn compilePropertyAccess(self: *Compiler, node: Ast.Node) Error!void {
+    try compilePropertyFetch(self, node, null);
+}
+
+fn compilePropertyFetch(self: *Compiler, node: Ast.Node, guard: ?ArgGuard) Error!void {
     // outermost chain link sets up the nullsafe-jump collection. inner nullsafe
     // links append their short-circuit jumps to this list so a `$x?->y()->z`
     // chain skips both `y()` and `z` when $x is null
@@ -1278,9 +1282,11 @@ pub fn compilePropertyAccess(self: *Compiler, node: Ast.Node) Error!void {
             const var_name = self.ast.tokenSlice(prop_node.main_token);
             try self.emitGetVar(var_name);
         }
+        if (guard) |g| try emitArgGuard(self, g, .arg_guard_prop_dynamic);
         try self.emitOp(.get_prop_dynamic);
     } else {
         const name_idx = try self.addConstant(.{ .string = Value.String.borrowed(self.propName(node)) });
+        if (guard) |g| try emitArgGuard(self, g, .arg_guard_prop);
         try self.emitOp(.get_prop);
         try self.emitU16(name_idx);
     }
@@ -1311,12 +1317,11 @@ pub fn compileMethodCall(self: *Compiler, node: Ast.Node) Error!void {
         const var_name = self.ast.tokenSlice(node.main_token);
         try self.emitGetVar(var_name);
         if (hasSplatOrNamed(self.ast, args)) {
-            try emitSpreadArgs(self, args);
-            try self.emitOp(.method_call_dynamic_spread);
+            var guards = try emitSpreadArgs(self, args);
+            try emitCallOp(self, &guards, .method_call_dynamic_spread, .{});
         } else {
-            for (args) |arg| try self.compileNode(arg);
-            try self.emitOp(.method_call_dynamic);
-            try self.emitByte(@intCast(args.len));
+            var guards = try compileArgs(self, args);
+            try emitCallOp(self, &guards, .method_call_dynamic, .{ .argc = @intCast(args.len) });
         }
         return;
     }
@@ -1325,14 +1330,11 @@ pub fn compileMethodCall(self: *Compiler, node: Ast.Node) Error!void {
     const name_idx = try self.addConstant(.{ .string = Value.String.borrowed(method_name) });
 
     if (hasSplatOrNamed(self.ast, args)) {
-        try emitSpreadArgs(self, args);
-        try self.emitOp(.method_call_spread);
-        try self.emitU16(name_idx);
+        var guards = try emitSpreadArgs(self, args);
+        try emitCallOp(self, &guards, .method_call_spread, .{ .a = name_idx });
     } else {
-        for (args) |arg| try self.compileNode(arg);
-        try self.emitOp(.method_call);
-        try self.emitU16(name_idx);
-        try self.emitByte(@intCast(args.len));
+        var guards = try compileArgs(self, args);
+        try emitCallOp(self, &guards, .method_call, .{ .a = name_idx, .argc = @intCast(args.len) });
     }
 }
 
@@ -1377,14 +1379,11 @@ pub fn compileNullsafeMethodCall(self: *Compiler, node: Ast.Node) Error!void {
     const name_idx = try self.addConstant(.{ .string = Value.String.borrowed(method_name) });
 
     if (hasSplatOrNamed(self.ast, args)) {
-        try emitSpreadArgs(self, args);
-        try self.emitOp(.method_call_spread);
-        try self.emitU16(name_idx);
+        var guards = try emitSpreadArgs(self, args);
+        try emitCallOp(self, &guards, .method_call_spread, .{ .a = name_idx });
     } else {
-        for (args) |arg| try self.compileNode(arg);
-        try self.emitOp(.method_call);
-        try self.emitU16(name_idx);
-        try self.emitByte(@intCast(args.len));
+        var guards = try compileArgs(self, args);
+        try emitCallOp(self, &guards, .method_call, .{ .a = name_idx, .argc = @intCast(args.len) });
     }
     try self.nullsafe_chain_jumps.?.append(self.allocator, end_jump);
 }
@@ -1404,10 +1403,8 @@ pub fn compileStaticCall(self: *Compiler, node: Ast.Node) Error!void {
     if (class_node.tag == .variable) {
         try self.compileNode(class_lhs_idx);
         const method_idx = try self.addConstant(.{ .string = Value.String.borrowed(method_name) });
-        for (args) |arg| try self.compileNode(arg);
-        try self.emitOp(.static_call_dynamic);
-        try self.emitU16(method_idx);
-        try self.emitByte(@intCast(args.len));
+        var guards = try compileArgs(self, args);
+        try emitCallOp(self, &guards, .static_call_dynamic, .{ .a = method_idx, .argc = @intCast(args.len) });
         return;
     }
 
@@ -1419,10 +1416,8 @@ pub fn compileStaticCall(self: *Compiler, node: Ast.Node) Error!void {
             try self.compileNode(class_lhs_idx);
             try self.emitOp(.get_obj_class);
             const method_idx = try self.addConstant(.{ .string = Value.String.borrowed(method_name) });
-            for (args) |arg| try self.compileNode(arg);
-            try self.emitOp(.static_call_dynamic);
-            try self.emitU16(method_idx);
-            try self.emitByte(@intCast(args.len));
+            var guards = try compileArgs(self, args);
+            try emitCallOp(self, &guards, .static_call_dynamic, .{ .a = method_idx, .argc = @intCast(args.len) });
             return;
         },
         else => {},
@@ -1433,16 +1428,11 @@ pub fn compileStaticCall(self: *Compiler, node: Ast.Node) Error!void {
     const method_idx = try self.addConstant(.{ .string = Value.String.borrowed(method_name) });
 
     if (hasSplatOrNamed(self.ast, args)) {
-        try emitSpreadArgs(self, args);
-        try self.emitOp(.static_call_spread);
-        try self.emitU16(class_idx);
-        try self.emitU16(method_idx);
+        var guards = try emitSpreadArgs(self, args);
+        try emitCallOp(self, &guards, .static_call_spread, .{ .a = class_idx, .b = method_idx });
     } else {
-        for (args) |arg| try self.compileNode(arg);
-        try self.emitOp(.static_call);
-        try self.emitU16(class_idx);
-        try self.emitU16(method_idx);
-        try self.emitByte(@intCast(args.len));
+        var guards = try compileArgs(self, args);
+        try emitCallOp(self, &guards, .static_call, .{ .a = class_idx, .b = method_idx, .argc = @intCast(args.len) });
     }
 }
 
@@ -1455,17 +1445,14 @@ pub fn compileDynamicStaticCall(self: *Compiler, node: Ast.Node) Error!void {
     if (class_node.tag == .variable) {
         try self.compileNode(node.data.lhs);
         try self.compileNode(method_expr);
-        for (args) |arg| try self.compileNode(arg);
-        try self.emitOp(.static_call_dyn_both);
-        try self.emitByte(@intCast(args.len));
+        var guards = try compileArgs(self, args);
+        try emitCallOp(self, &guards, .static_call_dyn_both, .{ .argc = @intCast(args.len) });
     } else {
         const class_name = try resolveNodeClassName(self, class_node);
         const class_idx = try self.addConstant(.{ .string = Value.String.borrowed(class_name) });
         try self.compileNode(method_expr);
-        for (args) |arg| try self.compileNode(arg);
-        try self.emitOp(.static_call_dyn_method);
-        try self.emitU16(class_idx);
-        try self.emitByte(@intCast(args.len));
+        var guards = try compileArgs(self, args);
+        try emitCallOp(self, &guards, .static_call_dyn_method, .{ .a = class_idx, .argc = @intCast(args.len) });
     }
 }
 
@@ -1603,15 +1590,11 @@ pub fn compileNewExpr(self: *Compiler, node: Ast.Node) Error!void {
     const args = self.ast.extraSlice(node.data.lhs);
     const name_idx = try self.addConstant(.{ .string = Value.String.borrowed(class_name) });
     if (hasSplatOrNamed(self.ast, args)) {
-        try emitSpreadArgs(self, args);
-        try self.emitOp(.new_obj);
-        try self.emitU16(name_idx);
-        try self.emitByte(0xFF);
+        var guards = try emitSpreadArgs(self, args);
+        try emitCallOp(self, &guards, .new_obj, .{ .a = name_idx, .argc = 0xFF });
     } else {
-        for (args) |arg| try self.compileNode(arg);
-        try self.emitOp(.new_obj);
-        try self.emitU16(name_idx);
-        try self.emitByte(@intCast(args.len));
+        var guards = try compileArgs(self, args);
+        try emitCallOp(self, &guards, .new_obj, .{ .a = name_idx, .argc = @intCast(args.len) });
     }
 }
 
@@ -1619,13 +1602,11 @@ pub fn compileNewExprDynamic(self: *Compiler, node: Ast.Node) Error!void {
     try self.compileNode(node.data.lhs);
     const args = self.ast.extraSlice(node.data.rhs);
     if (hasSplatOrNamed(self.ast, args)) {
-        try emitSpreadArgs(self, args);
-        try self.emitOp(.new_obj_dynamic);
-        try self.emitByte(0xFF);
+        var guards = try emitSpreadArgs(self, args);
+        try emitCallOp(self, &guards, .new_obj_dynamic, .{ .argc = 0xFF });
     } else {
-        for (args) |arg| try self.compileNode(arg);
-        try self.emitOp(.new_obj_dynamic);
-        try self.emitByte(@intCast(args.len));
+        var guards = try compileArgs(self, args);
+        try emitCallOp(self, &guards, .new_obj_dynamic, .{ .argc = @intCast(args.len) });
     }
 }
 

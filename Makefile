@@ -16,6 +16,7 @@ test: ## Run zig unit tests
 .PHONY: compat
 compat: build ## Run PHP compatibility tests (requires PHP 8.4)
 	python3 ./tests/compat_runner_test
+	python3 ./tests/asymmetric_declaration_validation_test
 	./tests/run
 
 .PHONY: pdo
@@ -30,6 +31,11 @@ examples: build ## Run example project tests (requires PHP 8.4)
 bench: ## Run runtime benchmarks (ReleaseFast)
 	zig build -Doptimize=ReleaseFast
 	./benchmarks/runtime/run
+
+.PHONY: soak
+soak: ## Run the memory soak (ReleaseFast): a string-heavy loop must hold a flat RSS
+	zig build -Doptimize=ReleaseFast
+	python3 ./tests/memory_soak
 
 .PHONY: bench-macro
 bench-macro: ## Track real-app perf vs php (WordPress + Laravel harnesses, ReleaseFast)
