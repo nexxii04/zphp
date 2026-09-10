@@ -1255,10 +1255,22 @@ fn dtiSetTimestamp(ctx: *NativeContext, args: []const Value) RuntimeError!Native
     return NativeResult.borrowed(.{ .object = new_obj });
 }
 
+// a float timestamp keeps its sub-second part as microseconds
+fn setTimestampWithFraction(ctx: *NativeContext, obj: *PhpObject, ts: Value) !void {
+    if (ts == .float) {
+        const whole = @floor(ts.float);
+        try obj.set(ctx.allocator, "timestamp", .{ .int = @intFromFloat(whole) });
+        const micros: i64 = @intFromFloat(@round((ts.float - whole) * 1_000_000.0));
+        if (micros != 0) try obj.set(ctx.allocator, "__microseconds", .{ .int = micros });
+        return;
+    }
+    try obj.set(ctx.allocator, "timestamp", .{ .int = Value.toInt(ts) });
+}
+
 fn dtCreateFromTimestamp(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     if (args.len == 0) return NativeResult.scalar(.null);
     const obj = try ctx.createObject("DateTime");
-    try obj.set(ctx.allocator, "timestamp", .{ .int = Value.toInt(args[0]) });
+    try setTimestampWithFraction(ctx, obj, args[0]);
     return NativeResult.borrowed(.{ .object = obj });
 }
 
@@ -1826,7 +1838,7 @@ fn weekdayNameLen(s: []const u8) ?usize {
 fn dtiCreateFromTimestamp(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     if (args.len == 0) return NativeResult.scalar(.null);
     const obj = try ctx.createObject("DateTimeImmutable");
-    try obj.set(ctx.allocator, "timestamp", .{ .int = Value.toInt(args[0]) });
+    try setTimestampWithFraction(ctx, obj, args[0]);
     return NativeResult.borrowed(.{ .object = obj });
 }
 
@@ -3792,10 +3804,22 @@ const TzBytes = struct {
     }
 };
 
+// zone files are read once per process: tzdata does not change while zphp
+// runs and every date() call in a timezone-aware app would otherwise reopen
+// /usr/share/zoneinfo/<name>. entries are keyed by the requested name and
+// never freed (a few KB per distinct zone); the mutex covers threaded serve
+var zone_cache: std.StringHashMapUnmanaged([]const u8) = .{};
+var zone_cache_mutex: std.Thread.Mutex = .{};
+
 fn resolveTzif(allocator: Allocator, name: []const u8) ?TzBytes {
-    if (readZoneInfo(allocator, name)) |b| return .{ .bytes = b, .owned = true };
-    if (embeddedZoneInfo(name)) |b| return .{ .bytes = b, .owned = false };
-    return null;
+    zone_cache_mutex.lock();
+    defer zone_cache_mutex.unlock();
+    if (zone_cache.get(name)) |b| return .{ .bytes = b, .owned = false };
+    const bytes: []const u8 = readZoneInfo(std.heap.page_allocator, name) orelse embeddedZoneInfo(name) orelse return null;
+    const key = std.heap.page_allocator.dupe(u8, name) catch return .{ .bytes = bytes, .owned = false };
+    zone_cache.put(std.heap.page_allocator, key, bytes) catch {};
+    _ = allocator;
+    return .{ .bytes = bytes, .owned = false };
 }
 
 test "embedded tzdata resolves non-table zones without system zoneinfo" {

@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -15,16 +17,17 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             name: linux-x86_64
           - os: ubuntu-24.04-arm
             name: linux-aarch64
           # pinned to 15: macos-latest = macOS 26 whose SDK zig 0.15.1 can't link
           - os: macos-15
             name: macos-aarch64
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             name: linux-x86_64-musl
             alpine: x86_64
             apk_sha: 34bb1a96f0258982377a289392d4ea9f3f4b767a4bb5806b1b87179b79ad8a1c
@@ -54,20 +57,25 @@ jobs:
         uses: jirutka/setup-alpine@v1
         with:
           arch: ${{ matrix.alpine }}
-          branch: latest-stable
+          # pinned: a new alpine release changes library packaging under our feet
+          branch: v3.22
           apk-tools-url: https://gitlab.alpinelinux.org/api/v4/projects/5/packages/generic/v2.14.10/${{ matrix.alpine }}/apk.static#!sha256!${{ matrix.apk_sha }}
           packages: >
-            build-base linux-headers curl xz
-            pcre2-dev sqlite-dev sqlite-static zlib-dev zlib-static
-            mariadb-connector-c-dev libpq-dev
+            build-base linux-headers curl xz cmake m4 python3
+            pcre2-dev pcre2-static sqlite-dev sqlite-static zlib-dev zlib-static
+            mariadb-connector-c-dev mariadb-static libpq-dev
             openssl-dev openssl-libs-static
-            nghttp2-dev nghttp2-static curl-dev curl-static
-            libxml2-dev libxml2-static
+            curl-dev curl-static c-ares-dev
+            zstd-static libidn2-dev libidn2-static libunistring-dev libunistring-static
+            libxml2-dev libxml2-static xz-static
             icu-dev icu-static icu-libs
-            gmp-dev
-            gd-dev
+            libpng-dev libpng-static libjpeg-turbo-dev libjpeg-turbo-static freetype-dev freetype-static bzip2-static
             libsodium-dev libsodium-static
-            openldap-dev
+
+      - name: build static dependencies (alpine)
+        if: matrix.alpine
+        shell: alpine.sh --root {0}
+        run: sh .github/scripts/musl_static_deps.sh
 
       - name: install zig (alpine)
         if: matrix.alpine
@@ -88,6 +96,8 @@ jobs:
       - name: build (musl)
         if: matrix.alpine
         shell: alpine.sh {0}
+        env:
+          PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
         run: zig build -Doptimize=ReleaseFast -Dcpu=baseline
 
       - name: smoke test (musl)
@@ -107,20 +117,99 @@ jobs:
           cp zig-out/bin/zphp zphp-${{ matrix.name }}
           chmod +x zphp-${{ matrix.name }}
 
+      # the packaged file is what ships, so that is what gets executed here,
+      # not the zig-out build it was copied from
+      - name: smoke test packaged binary (glibc/macos)
+        if: ${{ !matrix.alpine }}
+        run: |
+          ./zphp-${{ matrix.name }} version
+          ./zphp-${{ matrix.name }} run .github/scripts/release_smoke.php
+
+      # a musl artifact must be static: it runs on the ubuntu host here, outside
+      # alpine, with no musl loader available
+      - name: smoke test packaged binary (musl)
+        if: matrix.alpine
+        run: |
+          file zphp-${{ matrix.name }}
+          file zphp-${{ matrix.name }} | grep -q "statically linked"
+          ./zphp-${{ matrix.name }} version
+          ./zphp-${{ matrix.name }} run .github/scripts/release_smoke.php
+
+      # which native libraries the binary loads at runtime, with the versions
+      # the build host had. glibc and macos builds link them dynamically and
+      # need the same sonames on the target machine; musl builds are static
+      - name: record linked libraries (musl)
+        if: matrix.alpine
+        shell: alpine.sh {0}
+        run: |
+          {
+            echo "zphp-${{ matrix.name }} built on ${{ matrix.os }} in alpine v3.22 with zig 0.15.1"
+            echo "statically linked; no runtime library dependencies. archives linked in:"
+            echo
+            echo "built from source by .github/scripts/musl_static_deps.sh:"
+            cat /usr/local/share/zphp-static-deps.txt
+            echo
+            echo "alpine packages:"
+            apk info -v 2>/dev/null | grep -E '^(musl|pcre2|sqlite|zlib|mariadb|libpq|openssl|curl|c-ares|zstd|libidn2|libunistring|libxml2|xz|icu|libpng|libjpeg|freetype|bzip2|libsodium|brotli|nghttp2|libpsl)' || true
+          } > zphp-${{ matrix.name }}.libs.txt
+          cat zphp-${{ matrix.name }}.libs.txt
+
+      - name: record linked libraries
+        if: ${{ !matrix.alpine }}
+        run: |
+          {
+            echo "zphp-${{ matrix.name }} built on ${{ matrix.os }} with zig 0.15.1"
+            echo
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              otool -L zphp-${{ matrix.name }}
+              echo
+              brew list --versions mysql-client libpq openssl@3 nghttp2 curl libxml2 icu4c gmp gd libsodium openldap pcre2 sqlite 2>/dev/null || true
+            elif [ -n "${{ matrix.alpine }}" ]; then
+              echo "musl build: dynamically linked against musl and the alpine ${{ matrix.alpine }} packages below"
+              file zphp-${{ matrix.name }} || true
+            else
+              ldd zphp-${{ matrix.name }}
+              echo
+              dpkg-query -W libpcre2-8-0 libsqlite3-0 zlib1g libmysqlclient21 libpq5 libssl3t64 libnghttp2-14 libcurl4t64 libxml2 libicu74 libgmp10 libgd3 libsodium23 libldap2 2>/dev/null || dpkg-query -W 'libpcre2*' 'libsqlite3*' 'zlib1g' 'libmysqlclient*' 'libpq5' 'libssl3*' 'libnghttp2*' 'libcurl4*' 'libxml2' 'libicu*' 'libgmp10' 'libgd3' 'libsodium*' 'libldap*' 2>/dev/null || true
+            fi
+          } > zphp-${{ matrix.name }}.libs.txt
+          cat zphp-${{ matrix.name }}.libs.txt
+
+      - uses: actions/attest-build-provenance@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          subject-path: zphp-${{ matrix.name }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: zphp-${{ matrix.name }}
-          path: zphp-${{ matrix.name }}
+          path: |
+            zphp-${{ matrix.name }}
+            zphp-${{ matrix.name }}.libs.txt
 
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+      - name: checksums
+        run: |
+          cd artifacts
+          sha256sum zphp-* | grep -v '\.libs\.txt' > SHA256SUMS
+          cat SHA256SUMS
+      # the glibc x86_64 artifact runs on this runner: one last execution of
+      # exactly the bytes about to be published. the musl artifacts need the
+      # musl loader and were executed inside alpine in their build job
+      - name: execute published binary
+        run: |
+          cd artifacts
+          chmod +x zphp-linux-x86_64 zphp-linux-x86_64-musl
+          ./zphp-linux-x86_64-musl version
+          ./zphp-linux-x86_64 version
       - name: create release
         uses: softprops/action-gh-release@v2
         with:

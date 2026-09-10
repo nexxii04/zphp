@@ -5,6 +5,8 @@ const runtime_value = @import("runtime/value.zig");
 const VM = @import("runtime/vm.zig").VM;
 const Value = runtime_value.Value;
 const CompileResult = @import("pipeline/compiler.zig").CompileResult;
+const extension = @import("extension.zig");
+const ini_config = @import("ini_config.zig");
 const bytecode_format = @import("bytecode_format.zig");
 const error_format = @import("error_format.zig");
 
@@ -23,21 +25,76 @@ pub fn main() !void {
     };
     const allocator = if (release_allocator) std.heap.smp_allocator else gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const raw_args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, raw_args);
+
+    extension.loadStatic();
 
     if (bytecode_format.detectEmbeddedBytecode(allocator)) |bc| {
         defer allocator.free(bc);
-        try runBytecode(allocator, bc, args[0], if (args.len > 1) args[1..] else &.{});
+        try runBytecode(allocator, bc, raw_args[0], if (raw_args.len > 1) raw_args[1..] else &.{});
         return;
     }
 
+    const args = try loadStartupFlags(allocator, raw_args);
+    defer allocator.free(args);
+
     if (args.len < 2) {
-        try writeStdout("zphp 0.6.0\n");
+        try writeStdout("zphp 0.9.0\n");
         return;
     }
 
     try dispatch(allocator, args);
+}
+
+// `zphp [--extension=PATH]... [--ini=PATH] [-d name=value]... <command> ...`
+// loads dynamic extensions and the ini file before any VM exists. the ini
+// file comes from --ini, ZPHP_INI, or php.ini in the working directory; its
+// extension= lines load after the flags, -d definitions apply last, then
+// ZPHP_EXTENSION_DIR adds every library in that directory. returns the args
+// with the flags removed
+fn loadStartupFlags(allocator: std.mem.Allocator, raw_args: []const []const u8) ![]const []const u8 {
+    var args = std.ArrayListUnmanaged([]const u8){};
+    errdefer args.deinit(allocator);
+    var defines = std.ArrayListUnmanaged([]const u8){};
+    defer defines.deinit(allocator);
+    var ini_path: ?[]const u8 = null;
+    try args.append(allocator, raw_args[0]);
+    var i: usize = 1;
+    while (i < raw_args.len) : (i += 1) {
+        const arg = raw_args[i];
+        if (std.mem.startsWith(u8, arg, "--extension=")) {
+            extension.loadDynamic(arg["--extension=".len..]);
+        } else if (std.mem.eql(u8, arg, "--extension")) {
+            i += 1;
+            extension.loadDynamic(try flagValue(raw_args, i, "usage: zphp --extension=PATH <command>\n"));
+        } else if (std.mem.startsWith(u8, arg, "--ini=")) {
+            ini_path = arg["--ini=".len..];
+        } else if (std.mem.eql(u8, arg, "--ini")) {
+            i += 1;
+            ini_path = try flagValue(raw_args, i, "usage: zphp --ini=PATH <command>\n");
+        } else if (std.mem.startsWith(u8, arg, "-d") and arg.len > 2) {
+            try defines.append(allocator, arg[2..]);
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--define")) {
+            i += 1;
+            try defines.append(allocator, try flagValue(raw_args, i, "usage: zphp -d name=value <command>\n"));
+        } else {
+            try args.appendSlice(allocator, raw_args[i..]);
+            break;
+        }
+    }
+    ini_config.discover(ini_path);
+    for (defines.items) |d| ini_config.define(d);
+    if (std.posix.getenv("ZPHP_EXTENSION_DIR")) |dir| extension.loadDirectory(dir);
+    return args.toOwnedSlice(allocator);
+}
+
+fn flagValue(raw_args: []const []const u8, i: usize, usage: []const u8) ![]const u8 {
+    if (i >= raw_args.len) {
+        try writeStderr(usage);
+        std.process.exit(1);
+    }
+    return raw_args[i];
 }
 
 fn dispatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -56,6 +113,9 @@ fn dispatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--workers") and i + 1 < args.len) {
                 config.workers = std.fmt.parseInt(u16, args[i + 1], 10) catch 0;
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--idle-timeout") and i + 1 < args.len) {
+                config.idle_timeout_seconds = std.fmt.parseInt(u32, args[i + 1], 10) catch 60;
                 i += 1;
             } else if (std.mem.eql(u8, args[i], "--tls-cert") and i + 1 < args.len) {
                 config.tls_cert = args[i + 1];
@@ -87,7 +147,7 @@ fn dispatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try requireArg(args, 3, "usage: zphp build [--compile] <file>\n");
         try buildFile(allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version")) {
-        try writeStdout("zphp 0.6.0\n");
+        try writeStdout("zphp 0.9.0\n");
     } else {
         try writeStderr("unknown command: ");
         try writeStderr(cmd);
@@ -173,9 +233,62 @@ fn compileCachePath(allocator: std.mem.Allocator, path: []const u8, stat: std.fs
     hasher.update(std.mem.asBytes(&closure_counter));
     hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
-    const cache_root = try std.fs.getAppDataDir(allocator, "zphp");
-    defer allocator.free(cache_root);
+    const cache_root = try compileCacheRoot(allocator);
     return std.fmt.allocPrint(allocator, "{s}/{s}/{s}.zphpc", .{ cache_root, compile_cache_dir, hex });
+}
+
+// resolved once per process from the page allocator so the Debug allocator
+// does not report a deliberate process-lifetime allocation at exit
+var compile_cache_root: ?[]const u8 = null;
+
+fn compileCacheRoot(allocator: std.mem.Allocator) ![]const u8 {
+    if (compile_cache_root) |root| return root;
+    _ = allocator;
+    const root = try std.fs.getAppDataDir(std.heap.page_allocator, "zphp");
+    compile_cache_root = root;
+    return root;
+}
+
+const ResolvedSource = struct { abs_path: []const u8, stat: std.fs.File.Stat };
+
+// a file load used to cost a realpath (open + fcntl + close on macOS) plus
+// open + fstat before the bytecode cache was even consulted. directories
+// are canonicalized once per process and the file itself gets one lstat;
+// a file that is itself a symlink takes the full realpath route
+fn resolveSource(allocator: std.mem.Allocator, vm: *VM, path: []const u8) ?ResolvedSource {
+    const base = std.fs.path.basename(path);
+    if (base.len > 0 and !std.mem.eql(u8, base, ".") and !std.mem.eql(u8, base, "..")) {
+        if (realDir(vm, std.fs.path.dirname(path) orelse ".")) |real_dir| {
+            const sep: []const u8 = if (std.mem.endsWith(u8, real_dir, "/")) "" else "/";
+            const abs = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ real_dir, sep, base }) catch return null;
+            if (std.posix.fstatat(std.posix.AT.FDCWD, abs, std.posix.AT.SYMLINK_NOFOLLOW)) |st| {
+                const mode: u32 = @intCast(st.mode);
+                if (std.posix.S.ISREG(mode)) return .{ .abs_path = abs, .stat = std.fs.File.Stat.fromPosix(st) };
+            } else |_| {}
+            allocator.free(abs);
+        }
+    }
+    const abs = std.fs.cwd().realpathAlloc(allocator, path) catch allocator.dupe(u8, path) catch return null;
+    const stat = std.fs.cwd().statFile(abs) catch {
+        allocator.free(abs);
+        return null;
+    };
+    return .{ .abs_path = abs, .stat = stat };
+}
+
+fn realDir(vm: *VM, dir: []const u8) ?[]const u8 {
+    if (vm.realdir_cache.get(dir)) |real| return real;
+    const real = std.fs.cwd().realpathAlloc(vm.allocator, dir) catch return null;
+    const key = vm.allocator.dupe(u8, dir) catch {
+        vm.allocator.free(real);
+        return null;
+    };
+    vm.realdir_cache.put(vm.allocator, key, real) catch {
+        vm.allocator.free(key);
+        vm.allocator.free(real);
+        return null;
+    };
+    return real;
 }
 
 fn loadCompileCache(allocator: std.mem.Allocator, path: []const u8, stat: std.fs.File.Stat, closure_counter: u32) ?*CompileResult {
@@ -292,20 +405,18 @@ fn loadFile(path: []const u8, allocator: std.mem.Allocator, vm: *@import("runtim
             return null;
         };
     } else {
-        abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch allocator.dupe(u8, path) catch return null;
+        const resolved = resolveSource(allocator, vm, path) orelse return null;
+        abs_path = resolved.abs_path;
+        const stat = resolved.stat;
+        if (loadCompileCache(allocator, abs_path, stat, closure_counter)) |cached| {
+            allocator.free(abs_path);
+            return cached;
+        }
         const file = std.fs.cwd().openFile(abs_path, .{}) catch {
             allocator.free(abs_path);
             return null;
         };
         defer file.close();
-        const stat = file.stat() catch {
-            allocator.free(abs_path);
-            return null;
-        };
-        if (loadCompileCache(allocator, abs_path, stat, closure_counter)) |cached| {
-            allocator.free(abs_path);
-            return cached;
-        }
         source = file.readToEndAlloc(allocator, max_source_size) catch {
             allocator.free(abs_path);
             return null;
@@ -607,6 +718,7 @@ fn writeStderr(msg: []const u8) !void {
 }
 
 test {
+    _ = @import("ini_config.zig");
     _ = @import("pipeline/token.zig");
     _ = @import("pipeline/lexer.zig");
     _ = @import("pipeline/ast.zig");
@@ -619,6 +731,7 @@ test {
     _ = @import("stdlib/exceptions.zig");
     _ = @import("stdlib/registry.zig");
     _ = @import("stdlib/datetime.zig");
+    _ = @import("serve.zig");
     _ = @import("stdlib/pcre.zig");
     _ = @import("pipeline/parser_tests.zig");
     _ = @import("integration_tests.zig");

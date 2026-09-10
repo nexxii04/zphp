@@ -2,12 +2,12 @@ PKG_CONFIG_PATH := /opt/homebrew/opt/mysql-client/lib/pkgconfig:/opt/homebrew/op
 export PKG_CONFIG_PATH
 
 .PHONY: build
-build: ## Build zphp (Debug; ~30x slower than release due to Zig's debug allocator stack-trace capture). use `make release` for benchmarking
-	zig build
+build: ## Build zphp (Debug; ~30x slower than release due to Zig's debug allocator stack-trace capture). use `make release` for benchmarking. ZIG_FLAGS adds build options such as -Dextension=path.c
+	zig build $(ZIG_FLAGS)
 
 .PHONY: release
 release: ## Build zphp in ReleaseFast (no debug allocator overhead). prefer for any perf-sensitive run; for testing zphp's actual PHP-execution speed
-	zig build -Doptimize=ReleaseFast
+	zig build -Doptimize=ReleaseFast $(ZIG_FLAGS)
 
 .PHONY: test
 test: ## Run zig unit tests
@@ -31,6 +31,22 @@ examples: build ## Run example project tests (requires PHP 8.4)
 bench: ## Run runtime benchmarks (ReleaseFast)
 	zig build -Doptimize=ReleaseFast
 	./benchmarks/runtime/run
+
+.PHONY: bench-compare
+bench-compare: ## Time this tree against its merge base with main on this machine (ReleaseFast, interleaved); pass BASE=<ref> to pick the base
+	python3 ./benchmarks/compare $(if $(BASE),--base $(BASE),)
+
+.PHONY: fuzz
+fuzz: build ## Mutation-fuzz the pipeline and decoders on the Debug build (FUZZ_SECONDS per fuzzer, default 120)
+	python3 ./tests/fuzz/run all $(or $(FUZZ_SECONDS),120)
+
+.PHONY: ext
+ext: build ## Run extension API tests (builds tests/extensions/demo.c with zig cc; STATIC=1 also builds a zphp with it compiled in, BENCH=1 prints call overhead)
+	./tests/extensions/run
+
+.PHONY: ini
+ini: build ## Run php.ini loading tests (--ini, ZPHP_INI, -d, serve isolation, extension= lines)
+	./tests/ini_test
 
 .PHONY: soak
 soak: ## Run the memory soak (ReleaseFast): a string-heavy loop must hold a flat RSS

@@ -223,7 +223,9 @@ pub const NativeContext = struct {
 };
 
 pub const NativeResult = @import("native_result.zig").NativeResult;
-const NativeFn = *const fn (*NativeContext, []const Value) RuntimeError!NativeResult;
+const extension = @import("../extension.zig");
+pub const NativeFn = *const fn (*NativeContext, []const Value) RuntimeError!NativeResult;
+pub const NativeBinop = enum { add, sub, mul, div, mod, pow, compare, negate };
 
 pub const CaptureEntry = struct {
     closure_name: []const u8,
@@ -280,6 +282,10 @@ pub const ClassDef = struct {
     is_final: bool = false,
     is_readonly: bool = false,
     native_cleanup: ?*const fn (*PhpObject) bool = null,
+    // arithmetic and comparison on instances of a native class (BcMath\Number).
+    // null result means the operand pair is not supported and the ordinary
+    // TypeError path runs
+    native_binop: ?*const fn (*NativeContext, NativeBinop, Value, Value) RuntimeError!?Value = null,
     // set when any property-hook method ($hook_get/$hook_set) is registered on
     // this class. lets hasPropHook skip the per-access bufPrint + method lookup
     // for the >99% of classes that declare no hooks (PHP 8.4 feature). does not
@@ -597,6 +603,9 @@ pub const VM = struct {
     global_vars: std.ArrayListUnmanaged(StaticEntry) = .{},
     file_loader: ?*const FileLoader = null,
     loaded_files: std.StringHashMapUnmanaged(void) = .{},
+    // canonical directory paths keyed by the spelling a require used, so a
+    // file load costs one lstat instead of a realpath per file
+    realdir_cache: std.StringHashMapUnmanaged([]const u8) = .{},
     // protocols whose builtin stream wrapper has been disabled via stream_wrapper_unregister
     stream_wrappers_unregistered: std.StringHashMapUnmanaged(void) = .{},
     // protocol -> user class name registered via stream_wrapper_register
@@ -1122,6 +1131,13 @@ pub const VM = struct {
         // when a different class arrives or new code is declared
         intent: []IntentIC = &.{},
         arg_stack: []RefSource = &.{},
+        // third-party extension state lives here, off the VM struct, so the
+        // VM's field offsets stay put (see GOTCHAS on codegen perturbation):
+        // one slot per loaded extension, an arena for the value handles a
+        // call hands out, and whether request_init has run
+        ext_slots: []extension.VmSlot = &.{},
+        ext_arena: std.heap.ArenaAllocator = undefined,
+        ext_request_active: bool = false,
         // provenance of the call family opcode being executed, saved across a
         // nested call so a native callback's own calls cannot clobber it
         saved_sources: std.ArrayListUnmanaged(RefSource) = .{},
@@ -1325,15 +1341,20 @@ pub const VM = struct {
         return initInPlace(allocator);
     }
 
+    // every field defaults to an empty container, so a VM whose init failed
+    // part way can be torn down with the ordinary deinit
     pub fn initInPlace(allocator: Allocator) RuntimeError!VM {
         var vm = VM{ .allocator = allocator };
+        errdefer vm.deinit();
         try initVm(&vm, allocator);
         return vm;
     }
 
     pub fn initOnHeap(allocator: Allocator) RuntimeError!*VM {
         const vm = try allocator.create(VM);
+        errdefer allocator.destroy(vm);
         vm.* = .{ .allocator = allocator };
+        errdefer vm.deinit();
         try initVm(vm, allocator);
         return vm;
     }
@@ -1365,6 +1386,8 @@ pub const VM = struct {
         const locals_buf = try allocator.alloc(Value, 8192);
         vm.ic.?.locals_buf = locals_buf.ptr;
         vm.ic.?.locals_cap = 8192;
+        vm.ic.?.ext_arena = std.heap.ArenaAllocator.init(allocator);
+        try extension.vmInit(vm);
         // snapshot the builtin heap + class registration so serve-mode reset can
         // keep it instead of rebuilding every request (registry native fns are
         // never cleared; stdlib classes + their enum-case objects ARE the churn)
@@ -1402,6 +1425,7 @@ pub const VM = struct {
         try @import("../stdlib/xml_parser.zig").register(vm, allocator);
         try @import("../stdlib/intl.zig").register(vm, allocator);
         try @import("../stdlib/gmp.zig").register(vm, allocator);
+        try @import("../stdlib/bcmath.zig").register(vm, allocator);
         try @import("../stdlib/gd.zig").register(vm, allocator);
         try @import("../stdlib/soap.zig").register(vm, allocator);
         try @import("../stdlib/mysqli.zig").register(vm, allocator);
@@ -1872,6 +1896,9 @@ pub const VM = struct {
         try c.put(a, "E_USER_WARNING", .{ .int = 512 });
         try c.put(a, "E_USER_NOTICE", .{ .int = 1024 });
         try c.put(a, "E_STRICT", .{ .int = 2048 });
+        inline for (.{ .{ "PHP_OUTPUT_HANDLER_START", 1 }, .{ "PHP_OUTPUT_HANDLER_WRITE", 0 }, .{ "PHP_OUTPUT_HANDLER_FLUSH", 4 }, .{ "PHP_OUTPUT_HANDLER_CLEAN", 2 }, .{ "PHP_OUTPUT_HANDLER_FINAL", 8 }, .{ "PHP_OUTPUT_HANDLER_CONT", 0 }, .{ "PHP_OUTPUT_HANDLER_END", 8 }, .{ "PHP_OUTPUT_HANDLER_CLEANABLE", 16 }, .{ "PHP_OUTPUT_HANDLER_FLUSHABLE", 32 }, .{ "PHP_OUTPUT_HANDLER_REMOVABLE", 64 }, .{ "PHP_OUTPUT_HANDLER_STDFLAGS", 112 }, .{ "PHP_OUTPUT_HANDLER_STARTED", 4096 }, .{ "PHP_OUTPUT_HANDLER_DISABLED", 8192 }, .{ "PHP_OUTPUT_HANDLER_PROCESSED", 16384 } }) |k| {
+            try c.put(a, k[0], .{ .int = k[1] });
+        }
         try c.put(a, "E_RECOVERABLE_ERROR", .{ .int = 4096 });
         try c.put(a, "E_DEPRECATED", .{ .int = 8192 });
         try c.put(a, "E_USER_DEPRECATED", .{ .int = 16384 });
@@ -2306,8 +2333,12 @@ pub const VM = struct {
                 value.* = .null;
             }
         }
-        var class_it = self.classes.valueIterator();
-        while (class_it.next()) |class| {
+        // builtin classes survive a serve reset with their constants, enum
+        // cases, and property defaults intact; only user classes are torn down
+        var class_it = self.classes.iterator();
+        while (class_it.next()) |class_entry| {
+            if (!free_all and self.builtin_classes.contains(class_entry.key_ptr.*)) continue;
+            const class = class_entry.value_ptr;
             for (class.properties.items) |*property| {
                 if (property.default == .string) {
                     self.releaseValue(property.default);
@@ -2373,6 +2404,7 @@ pub const VM = struct {
         @import("../stdlib/xmlwriter.zig").cleanupResources(self.objects);
         @import("../stdlib/intl.zig").cleanupResources(self.objects);
         @import("../stdlib/gmp.zig").cleanupResources(self.objects);
+        extension.cleanupResources(self.objects);
         @import("../stdlib/gd.zig").cleanupResources(self.objects);
         @import("../stdlib/ftp.zig").cleanupResources(self.objects);
         @import("../stdlib/ldap.zig").cleanupResources(self.objects);
@@ -2507,6 +2539,7 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
+        extension.vmDeinit(self);
         if (self.ic) |ic| for (ic.arg_stack) |*source| self.releaseArgSource(source);
         self.clearActiveArgSources();
         self.clearArgArraySources(null);
@@ -2646,6 +2679,8 @@ pub const VM = struct {
         self.static_vars.deinit(self.allocator);
         self.global_vars.deinit(self.allocator);
         self.loaded_files.deinit(self.allocator);
+        self.clearRealDirCache();
+        self.realdir_cache.deinit(self.allocator);
         self.stream_wrappers_unregistered.deinit(self.allocator);
         self.stream_wrappers_user.deinit(self.allocator);
         if (self.serve_mode) {
@@ -2667,6 +2702,15 @@ pub const VM = struct {
         self.serve_compile_cache.deinit(self.allocator);
     }
 
+    pub fn clearRealDirCache(self: *VM) void {
+        var it = self.realdir_cache.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.realdir_cache.clearRetainingCapacity();
+    }
+
     pub fn reset(self: *VM) void {
         if (self.ic) |ic| {
             for (ic.arg_stack) |*source| self.releaseArgSource(source);
@@ -2682,6 +2726,7 @@ pub const VM = struct {
         self.releaseCallbackRegistries();
         // reap before freeHeapItems frees the proc objects (the map keys)
         self.reapProcChildren();
+        extension.endRequest(self);
         self.frame_high_water = 0;
         self.obj_ref_active = false;
         self.array_ref_active = false;
@@ -2763,6 +2808,25 @@ pub const VM = struct {
         self.headers_sent = false;
         self.default_tz_name = "UTC";
         self.default_tz_offset = 0;
+        // per-request runtime settings and last-error state; the strings
+        // below live in the request arena that this reset frees
+        self.error_reporting_level = 30719;
+        // ini_set stores keys and values in the request arena freed below;
+        // a stale entry would compare freed bytes on the next put
+        self.ini_settings.clearRetainingCapacity();
+        self.rng_seeded = false;
+        self.strtok_state = null;
+        self.strtok_pos = 0;
+        self.last_error_type = 0;
+        self.last_error_message = "";
+        self.last_error_file = "";
+        self.last_error_line = 0;
+        self.last_dt_error_count = 0;
+        self.last_dt_error_text = "";
+        self.last_dt_error_pos = 0;
+        self.last_dt_parse_failed = false;
+        self.last_intl_error_code = 0;
+        self.exit_code = 0;
         self.statics.clearRetainingCapacity();
         self.statics_cells.clearRetainingCapacity();
         self.globals_cells.clearRetainingCapacity();
@@ -2770,6 +2834,7 @@ pub const VM = struct {
         self.static_vars.clearRetainingCapacity();
         self.global_vars.clearRetainingCapacity();
         self.loaded_files.clearRetainingCapacity();
+        self.clearRealDirCache();
         self.stream_wrappers_unregistered.clearRetainingCapacity();
         self.stream_wrappers_user.clearRetainingCapacity();
         self.magic_get_guard.clearRetainingCapacity();
@@ -2790,6 +2855,7 @@ pub const VM = struct {
             self.php_constants.clearRetainingCapacity();
             self.user_constants.clearRetainingCapacity();
             initConstants(&self.php_constants, self.allocator) catch {};
+            extension.applyConstants(self) catch {};
             // builtins persist across reset now (freeClassState kept them), so the
             // stdlib classes + their native methods + enum objects DON'T need
             // rebuilding every request - that re-registration was the dominant
@@ -2818,6 +2884,8 @@ pub const VM = struct {
 
     pub fn interpret(self: *VM, result: *const CompileResult) RuntimeError!void {
         self.installHooks();
+        try @import("../ini_config.zig").applyToVm(self);
+        try extension.beginRequest(self);
         try self.registerResultFunctions(result);
         for (result.type_hints.items) |th| {
             try g_type_info.put(self.allocator, th.name, .{ .param_types = th.param_types, .return_type = th.return_type });
@@ -3395,6 +3463,10 @@ pub const VM = struct {
                     if (a == .array and b == .array) {
                         self.push(.{ .array = try self.arrayUnion(a.array, b.array) });
                     } else {
+                        if (try self.objectBinop(.add, a, b)) |r| {
+                            self.push(r);
+                            continue;
+                        }
                         if (try self.checkArithOperands(a, b, "+")) continue;
                         self.push(Value.add(a, b));
                     }
@@ -3402,12 +3474,20 @@ pub const VM = struct {
                 .subtract => {
                     const b = self.pop();
                     const a = self.pop();
+                    if (try self.objectBinop(.sub, a, b)) |r| {
+                        self.push(r);
+                        continue;
+                    }
                     if (try self.checkArithOperands(a, b, "-")) continue;
                     self.push(Value.subtract(a, b));
                 },
                 .multiply => {
                     const b = self.pop();
                     const a = self.pop();
+                    if (try self.objectBinop(.mul, a, b)) |r| {
+                        self.push(r);
+                        continue;
+                    }
                     if (try self.checkArithOperands(a, b, "*")) continue;
                     self.push(Value.multiply(a, b));
                 },
@@ -3424,6 +3504,10 @@ pub const VM = struct {
                 .divide => {
                     const b = self.pop();
                     const a = self.pop();
+                    if (try self.objectBinop(.div, a, b)) |r| {
+                        self.push(r);
+                        continue;
+                    }
                     if (try self.checkArithOperands(a, b, "/")) continue;
                     const bv = Value.toFloat(b);
                     if (bv == 0.0) {
@@ -3435,6 +3519,10 @@ pub const VM = struct {
                 .modulo => {
                     const b = self.pop();
                     const a = self.pop();
+                    if (try self.objectBinop(.mod, a, b)) |r| {
+                        self.push(r);
+                        continue;
+                    }
                     if (try self.checkArithOperands(a, b, "%")) continue;
                     const bi = Value.toInt(b);
                     if (bi == 0) {
@@ -3446,11 +3534,19 @@ pub const VM = struct {
                 .power => {
                     const b = self.pop();
                     const a = self.pop();
+                    if (try self.objectBinop(.pow, a, b)) |r| {
+                        self.push(r);
+                        continue;
+                    }
                     if (try self.checkArithOperands(a, b, "**")) continue;
                     self.push(Value.power(a, b));
                 },
                 .negate => {
                     const v = self.pop();
+                    if (try self.objectBinop(.negate, v, .null)) |r| {
+                        self.push(r);
+                        continue;
+                    }
                     if (!isArithOperand(v)) {
                         const tn = arithTypeName(v);
                         const msg = try std.fmt.allocPrint(self.allocator, "Cannot negate {s}", .{tn});
@@ -10758,24 +10854,42 @@ pub const VM = struct {
     pub fn getStaticProp(self: *VM, class_name: []const u8, prop_name: []const u8) ?Value {
         var current: ?[]const u8 = class_name;
         while (current) |cn| {
-            if (self.classes.getPtr(cn)) |cls| {
-                if (cls.static_props.get(prop_name)) |val| return val;
-                for (cls.interfaces.items) |iface| {
-                    if (self.getStaticProp(iface, prop_name)) |val| return val;
-                }
-                current = cls.parent;
+            if (self.classes.contains(cn)) {
+                if (self.staticPropStep(cn, prop_name)) |step| {
+                    if (step.found) |val| return val;
+                    current = step.parent;
+                } else break;
             } else {
                 self.tryAutoload(cn) catch {};
-                if (self.classes.getPtr(cn)) |cls| {
-                    if (cls.static_props.get(prop_name)) |val| return val;
-                    for (cls.interfaces.items) |iface| {
-                        if (self.getStaticProp(iface, prop_name)) |val| return val;
-                    }
-                    current = cls.parent;
+                if (self.staticPropStep(cn, prop_name)) |step| {
+                    if (step.found) |val| return val;
+                    current = step.parent;
                 } else break;
             }
         }
         return null;
+    }
+
+    const StaticPropStep = struct { found: ?Value, parent: ?[]const u8 };
+
+    // one class of the lookup chain. the interface walk can autoload, which
+    // rehashes `classes`, so the class entry is never held across that
+    // recursion: names are copied out first and only they are used after
+    fn staticPropStep(self: *VM, cn: []const u8, prop_name: []const u8) ?StaticPropStep {
+        var ifaces: [64][]const u8 = undefined;
+        var n: usize = 0;
+        var parent: ?[]const u8 = null;
+        {
+            const cls = self.classes.getPtr(cn) orelse return null;
+            if (cls.static_props.get(prop_name)) |val| return .{ .found = val, .parent = null };
+            n = @min(cls.interfaces.items.len, ifaces.len);
+            @memcpy(ifaces[0..n], cls.interfaces.items[0..n]);
+            parent = cls.parent;
+        }
+        for (ifaces[0..n]) |iface| {
+            if (self.getStaticProp(iface, prop_name)) |val| return .{ .found = val, .parent = null };
+        }
+        return .{ .found = null, .parent = parent };
     }
 
     // like getStaticProp but returns a pointer to the storage slot (walking the
@@ -11127,6 +11241,17 @@ pub const VM = struct {
     /// PHP 8 rejects non-numeric strings, arrays (except for +), and objects
     /// without __toString as arithmetic operands with TypeError. returns true
     /// when the throw was caught in-frame and the caller should `continue`
+    fn objectBinop(self: *VM, op: NativeBinop, a: Value, b: Value) RuntimeError!?Value {
+        if (a != .object and b != .object) return null;
+        const hook = blk: {
+            if (a == .object) if (self.classes.get(a.object.class_name)) |cls| if (cls.native_binop) |h| break :blk h;
+            if (b == .object) if (self.classes.get(b.object.class_name)) |cls| if (cls.native_binop) |h| break :blk h;
+            return null;
+        };
+        var ctx = self.makeContext(null);
+        return hook(&ctx, op, a, b);
+    }
+
     pub fn checkArithOperands(self: *VM, a: Value, b: Value, comptime op: []const u8) RuntimeError!bool {
         if (isArithOperand(a) and isArithOperand(b)) {
             if (a == .string and isPartialNumericString(a.string.bytes())) self.emitNonNumericWarning();
@@ -13337,7 +13462,7 @@ pub const VM = struct {
                 self.saveFrameArgs(arg_count);
                 self.dropN(ac);
                 try self.fillDefaults(&new_vars, func, bind_count);
-                const inherit_cc = self.closureScopeByName(name) orelse self.currentFrame().called_class;
+                const inherit_cc = self.closureScopeByName(name) orelse self.callerCalledClass();
                 self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func, .ref_slots = closure_refs, .called_class = inherit_cc, .call_name = name };
                 self.frames[self.frame_count].entry_sp = self.sp;
                 self.setFrameArgCount(arg_count);
@@ -13385,7 +13510,7 @@ pub const VM = struct {
             }
         }
 
-        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = .{}, .locals = locals, .func = func, .called_class = self.closureScopeByName(name) orelse self.currentFrame().called_class, .call_name = name };
+        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = .{}, .locals = locals, .func = func, .called_class = self.closureScopeByName(name) orelse self.callerCalledClass(), .call_name = name };
         self.frames[self.frame_count].entry_sp = self.sp;
         self.setFrameArgCount(arg_count);
         self.frame_count += 1;
@@ -14822,6 +14947,7 @@ pub const VM = struct {
 
     // mirror of looseEqualWithStringable for ordered comparisons
     pub fn compareWithStringable(self: *VM, a: Value, b: Value) RuntimeError!i64 {
+        if (try self.objectBinop(.compare, a, b)) |r| return r.int;
         if (a == .object and b == .string) {
             if (self.hasMethod(a.object.class_name, "__toString")) {
                 const s = try self.callMethod(a.object, "__toString", &.{});
@@ -14840,6 +14966,7 @@ pub const VM = struct {
     // __toString and compares as strings. Value.equal can't reach into the VM
     // to call methods, so this wrapper does that coercion before delegating
     pub fn looseEqualWithStringable(self: *VM, a: Value, b: Value) RuntimeError!bool {
+        if (try self.objectBinop(.compare, a, b)) |r| return r.int == 0;
         if (a == .object and b == .string) {
             if (self.hasMethod(a.object.class_name, "__toString")) {
                 const s = try self.callMethod(a.object, "__toString", &.{});
@@ -17070,7 +17197,7 @@ pub const VM = struct {
                     return error.RuntimeError;
                 }
                 const inherit_cc = if (std.mem.startsWith(u8, name, "__closure_"))
-                    self.closureScopeByName(name) orelse self.currentFrame().called_class
+                    self.closureScopeByName(name) orelse self.callerCalledClass()
                 else
                     null;
                 self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = new_vars, .locals = try self.allocLocals(func, &new_vars), .func = func, .ref_slots = callee_refs, .ref_owner = callee_owner, .called_class = inherit_cc, .call_name = name };
@@ -17398,6 +17525,13 @@ pub const VM = struct {
         return self.capture_index.get(name);
     }
 
+    // a closure invoked with no frame on the stack (a shutdown callback after
+    // a serve request) has no caller scope to inherit
+    fn callerCalledClass(self: *VM) ?[]const u8 {
+        if (self.frame_count == 0) return null;
+        return self.currentFrame().called_class;
+    }
+
     fn executeClosureLocalsOnly(self: *VM, func: *const ObjFunction, name: []const u8, args: []const Value) RuntimeError!Value {
         const base_frame = self.frame_count;
         const lc: usize = func.local_count;
@@ -17437,7 +17571,7 @@ pub const VM = struct {
         const base_handler = self.handler_count;
         const prev_floor = self.handler_floor;
         self.handler_floor = self.handler_count;
-        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = .{}, .locals = locals, .func = func, .called_class = self.closureScopeByName(name) orelse self.currentFrame().called_class, .call_name = name };
+        self.frames[self.frame_count] = .{ .chunk = &func.chunk, .ip = 0, .vars = .{}, .locals = locals, .func = func, .called_class = self.closureScopeByName(name) orelse self.callerCalledClass(), .call_name = name };
         self.frames[self.frame_count].entry_sp = self.sp;
         self.consumePendingArgCount();
         self.saveFrameArgsSlice(args);

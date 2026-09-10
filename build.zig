@@ -25,10 +25,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // static extensions: C sources compiled into the binary. the generated
+    // module lists their entry points so the loader finds them without dlopen
+    const extension_sources = b.option([]const []const u8, "extension", "C source of a static extension, repeatable; the file stem is the extension name") orelse &.{};
+    const static_extensions = staticExtensionsModule(b, extension_sources);
+    exe_mod.addImport("static_extensions", static_extensions);
+    fast_loop_mod.addImport("static_extensions", static_extensions);
+    for (extension_sources) |source| {
+        exe_mod.addCSourceFile(.{ .file = .{ .cwd_relative = source }, .flags = &.{ "-std=c11", "-DZPHP_STATIC_EXTENSION" } });
+    }
+    exe_mod.addIncludePath(b.path("include"));
+
     exe_mod.linkSystemLibrary("pcre2-8", .{ .preferred_link_mode = .static });
     exe_mod.linkSystemLibrary("sqlite3", .{ .preferred_link_mode = .static });
     exe_mod.linkSystemLibrary("z", .{ .preferred_link_mode = .static });
-    exe_mod.linkSystemLibrary("mysqlclient", .{});
+    addMysqlClient(b, exe_mod);
     exe_mod.linkSystemLibrary("pq", .{});
     addOpenSsl(b, exe_mod);
     exe_mod.linkSystemLibrary("nghttp2", .{ .preferred_link_mode = .static });
@@ -45,10 +56,28 @@ pub fn build(b: *std.Build) void {
     exe_mod.link_libc = true;
     exe_mod.addObject(fast_loop_obj);
 
+    // musl release binaries are fully static so they run on any linux. every
+    // system library becomes the path of its archive, the archives behind
+    // them come from pkg-config's static view, and the exe is linked -static
+    const static_musl = target.result.abi.isMusl();
+    if (static_musl) {
+        addStaticDependencies(b, exe_mod);
+        addGccLibstdcxx(b, exe_mod);
+        pinStaticArchives(b, exe_mod);
+    }
+
+    // -Dframe-pointers keeps frame pointers in release builds so `sample`
+    // and perf can unwind the stack when profiling by time
+    if (b.option(bool, "frame-pointers", "keep frame pointers for profiling") orelse false) {
+        exe_mod.omit_frame_pointer = false;
+        fast_loop_mod.omit_frame_pointer = false;
+    }
+
     const exe = b.addExecutable(.{
         .name = "zphp",
         .root_module = exe_mod,
         .use_llvm = true,
+        .linkage = if (static_musl) .static else null,
     });
     exe.stack_size = 64 * 1024 * 1024;
     b.installArtifact(exe);
@@ -73,11 +102,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_mod.addImport("static_extensions", static_extensions);
 
     test_mod.linkSystemLibrary("pcre2-8", .{ .preferred_link_mode = .static });
     test_mod.linkSystemLibrary("sqlite3", .{ .preferred_link_mode = .static });
     test_mod.linkSystemLibrary("z", .{ .preferred_link_mode = .static });
-    test_mod.linkSystemLibrary("mysqlclient", .{});
+    addMysqlClient(b, test_mod);
     test_mod.linkSystemLibrary("pq", .{});
     addOpenSsl(b, test_mod);
     test_mod.linkSystemLibrary("nghttp2", .{ .preferred_link_mode = .static });
@@ -131,6 +161,130 @@ fn addOpenSsl(b: *std.Build, mod: *std.Build.Module) void {
     if (pkgConfigVariable(b, "openssl", "libdir")) |lib| {
         mod.addLibraryPath(.{ .cwd_relative = lib });
     }
+}
+
+// ubuntu and homebrew ship mysqlclient.pc. alpine ships the same API as
+// libmariadb.pc (mariadb-connector-c-dev) with headers under /usr/include/mysql
+// and the static archive in mariadb-static
+fn addMysqlClient(b: *std.Build, mod: *std.Build.Module) void {
+    if (pkgConfigVariable(b, "mysqlclient", "libdir") != null) {
+        mod.linkSystemLibrary("mysqlclient", .{});
+        return;
+    }
+    if (pkgConfigVariable(b, "libmariadb", "includedir")) |inc| {
+        mod.addIncludePath(.{ .cwd_relative = inc });
+        mod.linkSystemLibrary("mariadb", .{ .preferred_link_mode = .static });
+        return;
+    }
+    mod.linkSystemLibrary("mysqlclient", .{});
+}
+
+// every -l and -L that `pkg-config --static --libs` reports for the libraries
+// zphp links, so a static musl link sees the archives behind each archive
+// (curl needs nghttp2, brotli, zstd, idn2, psl; gd needs png, jpeg, webp,
+// freetype; ldap needs sasl; ...). packages without a .pc file are covered
+// by the direct linkSystemLibrary calls above
+fn addStaticDependencies(b: *std.Build, mod: *std.Build.Module) void {
+    const pkgs = [_][]const u8{ "libpcre2-8", "sqlite3", "zlib", "libmariadb", "libpq", "openssl", "libnghttp2", "libcurl", "libxml-2.0", "icu-i18n", "icu-uc", "gmp", "gdlib", "libsodium", "ldap", "lber" };
+    const target = mod.resolved_target.?.result;
+    for (pkgs) |pkg| {
+        const r = std.process.Child.run(.{
+            .allocator = b.allocator,
+            .argv = &.{ "pkg-config", "--static", "--libs", pkg },
+        }) catch continue;
+        if (r.term != .Exited or r.term.Exited != 0) continue;
+        var it = std.mem.tokenizeAny(u8, r.stdout, " \t\r\n");
+        while (it.next()) |flag| {
+            if (std.mem.startsWith(u8, flag, "-l")) {
+                const name = staticArchiveName(flag[2..]);
+                if (std.zig.target.isLibCLibName(&target, name)) continue;
+                mod.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+            } else if (std.mem.startsWith(u8, flag, "-L")) {
+                mod.addLibraryPath(.{ .cwd_relative = flag[2..] });
+            }
+        }
+    }
+}
+
+// libpq.pc names libpgcommon and libpgport, but those archives are the
+// frontend builds with the encoding symbols renamed to *_private; the copies
+// libpq.a itself was linked against are the _shlib archives
+fn staticArchiveName(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "pgcommon")) return "pgcommon_shlib";
+    if (std.mem.eql(u8, name, "pgport")) return "pgport_shlib";
+    return name;
+}
+
+// alpine's icu archives are gcc builds that pull in libstdc++ internals, so
+// gcc's libstdc++.a is linked alongside the libc++ zig links for the icu shim.
+// zig treats -lstdc++ as a request for its own libc++, hence the archive path
+fn addGccLibstdcxx(b: *std.Build, mod: *std.Build.Module) void {
+    const r = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "cc", "-print-file-name=libstdc++.a" },
+    }) catch return;
+    if (r.term != .Exited or r.term.Exited != 0) return;
+    const path = std.mem.trim(u8, r.stdout, " \r\n");
+    if (!std.fs.path.isAbsolute(path)) return;
+    mod.addObjectFile(.{ .cwd_relative = path });
+}
+
+// zig resolves -l flags with the mode in force when it parses them, and the
+// build system emits -static after them, so a -l would still pick a shared
+// object. archive paths sidestep that: they are plain link inputs
+fn pinStaticArchives(b: *std.Build, mod: *std.Build.Module) void {
+    for (mod.link_objects.items) |*obj| switch (obj.*) {
+        .system_lib => |lib| obj.* = .{ .static_path = .{ .cwd_relative = findStaticArchive(b, mod, lib.name) } },
+        else => {},
+    };
+}
+
+fn findStaticArchive(b: *std.Build, mod: *std.Build.Module, name: []const u8) []const u8 {
+    const file = b.fmt("lib{s}.a", .{name});
+    for (mod.lib_paths.items) |lib_path| {
+        const dir = switch (lib_path) {
+            .cwd_relative => |p| p,
+            else => continue,
+        };
+        if (archiveIn(b, dir, file)) |path| return path;
+    }
+    for ([_][]const u8{ "/usr/local/lib", "/usr/lib" }) |dir| {
+        if (archiveIn(b, dir, file)) |path| return path;
+    }
+    std.debug.panic("no static archive lib{s}.a for the musl build", .{name});
+}
+
+fn archiveIn(b: *std.Build, dir: []const u8, file: []const u8) ?[]const u8 {
+    const path = b.pathJoin(&.{ dir, file });
+    std.fs.cwd().access(path, .{}) catch return null;
+    return path;
+}
+
+fn staticExtensionsModule(b: *std.Build, sources: []const []const u8) *std.Build.Module {
+    var code = std.ArrayListUnmanaged(u8){};
+    const w = code.writer(b.allocator);
+    w.writeAll("pub const Entry = *const fn (*const anyopaque) callconv(.c) ?*const anyopaque;\n") catch @panic("OOM");
+    w.writeAll("pub const StaticExtension = struct { name: []const u8, entry: Entry };\n") catch @panic("OOM");
+    for (sources) |source| {
+        const stem = std.fs.path.stem(source);
+        if (!validIdentifier(stem)) std.debug.panic("-Dextension={s}: the file stem must be a C identifier, it names the extension entry", .{source});
+        w.print("extern fn zphp_extension_entry_{s}(api: *const anyopaque) callconv(.c) ?*const anyopaque;\n", .{stem}) catch @panic("OOM");
+    }
+    w.writeAll("pub const entries = [_]StaticExtension{") catch @panic("OOM");
+    for (sources) |source| {
+        const stem = std.fs.path.stem(source);
+        w.print(" .{{ .name = \"{s}\", .entry = &zphp_extension_entry_{s} }},", .{ source, stem }) catch @panic("OOM");
+    }
+    w.writeAll(" };\n") catch @panic("OOM");
+    const files = b.addWriteFiles();
+    const path = files.add("static_extensions.zig", code.items);
+    return b.createModule(.{ .root_source_file = path });
+}
+
+fn validIdentifier(s: []const u8) bool {
+    if (s.len == 0 or std.ascii.isDigit(s[0])) return false;
+    for (s) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return false;
+    return true;
 }
 
 fn pkgConfigVariable(b: *std.Build, pkg: []const u8, name: []const u8) ?[]const u8 {
