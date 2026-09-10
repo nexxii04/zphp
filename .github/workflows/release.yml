@@ -129,7 +129,22 @@ jobs:
       # which native libraries the binary loads at runtime, with the versions
       # the build host had. glibc and macos builds link them dynamically and
       # need the same sonames on the target machine; musl builds are static
+      - name: record linked libraries (musl)
+        if: matrix.alpine
+        shell: alpine.sh {0}
+        run: |
+          {
+            echo "zphp-${{ matrix.name }} built on ${{ matrix.os }} in alpine v3.22 with zig 0.15.1"
+            echo "dynamically linked against musl; needs a musl-based system with these packages:"
+            echo
+            ldd zphp-${{ matrix.name }} || true
+            echo
+            apk info -v 2>/dev/null | grep -E '^(musl|pcre2|sqlite|zlib|mariadb|libpq|openssl|nghttp2|curl|libxml2|icu|gmp|gd|libsodium|libldap|openldap)' || true
+          } > zphp-${{ matrix.name }}.libs.txt
+          cat zphp-${{ matrix.name }}.libs.txt
+
       - name: record linked libraries
+        if: ${{ !matrix.alpine }}
         run: |
           {
             echo "zphp-${{ matrix.name }} built on ${{ matrix.os }} with zig 0.15.1"
@@ -139,7 +154,7 @@ jobs:
               echo
               brew list --versions mysql-client libpq openssl@3 nghttp2 curl libxml2 icu4c gmp gd libsodium openldap pcre2 sqlite 2>/dev/null || true
             elif [ -n "${{ matrix.alpine }}" ]; then
-              echo "static musl build (no runtime library dependencies beyond the kernel)"
+              echo "musl build: dynamically linked against musl and the alpine ${{ matrix.alpine }} packages below"
               file zphp-${{ matrix.name }} || true
             else
               ldd zphp-${{ matrix.name }}
@@ -175,13 +190,13 @@ jobs:
           cd artifacts
           sha256sum zphp-* | grep -v '\.libs\.txt' > SHA256SUMS
           cat SHA256SUMS
-      # the x86_64 artifacts run on this runner: one last execution of exactly
-      # the bytes that are about to be published
-      - name: execute published binaries
+      # the glibc x86_64 artifact runs on this runner: one last execution of
+      # exactly the bytes about to be published. the musl artifacts need the
+      # musl loader and were executed inside alpine in their build job
+      - name: execute published binary
         run: |
           cd artifacts
-          chmod +x zphp-linux-x86_64 zphp-linux-x86_64-musl
-          ./zphp-linux-x86_64-musl version
+          chmod +x zphp-linux-x86_64
           ./zphp-linux-x86_64 version
       - name: create release
         uses: softprops/action-gh-release@v2
