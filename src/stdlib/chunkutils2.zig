@@ -943,11 +943,23 @@ fn pbaGetBitsPerBlock(ctx: *NativeContext, _: []const Value) RuntimeError!Native
 fn pbaGet(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     const obj = getThis(ctx) orelse return NativeResult.scalar(.null);
     if (args.len < 3) return NativeResult.scalar(.null);
+    const container = getPBA(obj) orelse return NativeResult.scalar(.null);
+    const arr = container.array;
+    if (arr.bits_per_block == 0)
+        return NativeResult.scalar(.{ .int = @intCast(arr.palette.get(0)) });
+
     const x: u8 = @intCast(@as(u64, @bitCast(Value.toInt(args[0]))) & 0xff);
     const y: u8 = @intCast(@as(u64, @bitCast(Value.toInt(args[1]))) & 0xff);
     const z: u8 = @intCast(@as(u64, @bitCast(Value.toInt(args[2]))) & 0xff);
-    const container = getPBA(obj) orelse return NativeResult.scalar(.null);
-    return NativeResult.scalar(.{ .int = @intCast(container.get(x, y, z)) });
+
+    // Inline getPaletteOffset → find → palette.get
+    const idx: u16 = (@as(u16, x) << 8) | (@as(u16, z) << 4) | @as(u16, y);
+    const loc: struct { word_idx: u16, shift: u8 } = if (arr.word_shift != 0)
+        .{ .word_idx = idx >> arr.word_shift, .shift = @intCast((idx & arr.word_mask) * @as(u32, arr.bits_per_block)) }
+    else
+        .{ .word_idx = @intCast(idx / arr.blocks_per_word), .shift = @intCast((idx % arr.blocks_per_word) * @as(u32, arr.bits_per_block)) };
+    const palette_offset = (arr.words[loc.word_idx] >> @as(u5, @intCast(loc.shift))) & arr.block_mask;
+    return NativeResult.scalar(.{ .int = @intCast(arr.palette.get(palette_offset)) });
 }
 
 fn pbaSet(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
@@ -958,7 +970,8 @@ fn pbaSet(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     const z: u8 = @intCast(@as(u64, @bitCast(Value.toInt(args[2]))) & 0xff);
     const val: Block = @intCast(@as(u64, @bitCast(Value.toInt(args[3]))) & 0xffffffff);
     const container = getPBA(obj) orelse return NativeResult.scalar(.null);
-    container.set(c2_alloc, x, y, z, val) catch return error.OutOfMemory;
+    // Inline set → addOrLookup → setPaletteOffset
+    _ = container.set(c2_alloc, x, y, z, val) catch return error.OutOfMemory;
     return NativeResult.scalar(.null);
 }
 
