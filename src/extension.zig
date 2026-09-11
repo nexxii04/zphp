@@ -16,13 +16,12 @@ const InterfaceDef = vm_mod.InterfaceDef;
 const value_mod = @import("runtime/value.zig");
 const Value = value_mod.Value;
 const PhpArray = value_mod.PhpArray;
+const NativeHandle = value_mod.NativeHandle;
 const PhpObject = value_mod.PhpObject;
 const static_extensions = @import("static_extensions");
 
 pub const abi_version: u32 = 1;
 const max_functions = 2048;
-const ptr_property = "__ext_ptr";
-const type_property = "__ext_type";
 
 pub const Descriptor = extern struct {
     abi: u32,
@@ -358,23 +357,20 @@ pub fn vmDeinit(vm: *VM) void {
     vm.ic.?.ext_slots = &.{};
 }
 
-// resource objects: the native pointer and its type live in two hidden
-// properties; the destructor runs once, then the pointer is zeroed
+// the destructor runs once, then the pointer is zeroed
 fn resourceCleanup(obj: *PhpObject) bool {
-    const ptr = obj.get(ptr_property);
-    const kind = obj.get(type_property);
-    if (ptr != .int or ptr.int == 0 or kind != .int) return true;
-    const index: usize = @intCast(kind.int - 1);
-    if (index < resource_types.items.len) resource_types.items[index].dtor(@ptrFromInt(@as(usize, @intCast(ptr.int))));
-    if (obj.properties.getPtr(ptr_property)) |slot| slot.* = .{ .int = 0 };
+    const id = obj.native.extensionId() orelse return true;
+    if (obj.native.ptr == 0 or id == 0) return true;
+    const index: usize = id - 1;
+    if (index < resource_types.items.len) resource_types.items[index].dtor(@ptrFromInt(obj.native.ptr));
+    obj.native.ptr = 0;
     return true;
 }
 
 pub fn cleanupResources(objects: std.ArrayListUnmanaged(*PhpObject)) void {
     if (resource_types.items.len == 0) return;
     for (objects.items) |obj| {
-        if (obj.pooled) continue;
-        if (obj.get(type_property) != .int) continue;
+        if (obj.pooled or obj.native.extensionId() == null) continue;
         _ = resourceCleanup(obj);
     }
 }
@@ -543,8 +539,6 @@ fn apiRegisterResource(ext: *Extension, class_name: CStr, dtor: ?ResourceDtor) c
     resource_types.append(persistent(), reg) catch return 0;
     ext.resources.append(persistent(), reg) catch return 0;
     cls.resource_type = @intCast(resource_types.items.len);
-    cls.properties.append(persistent(), .{ .name = ptr_property, .default = .{ .int = 0 } }) catch return 0;
-    cls.properties.append(persistent(), .{ .name = type_property, .default = .{ .int = @intCast(resource_types.items.len) } }) catch return 0;
     return cls.resource_type.?;
 }
 
@@ -744,8 +738,7 @@ fn apiMakeResource(call: *Call, kind: u32, ptr: ?*anyopaque) callconv(.c) ?*Valu
     if (kind == 0 or kind > resource_types.items.len) return null;
     const class_name = resource_types.items[kind - 1].class_name;
     const obj = call.ctx.createObject(class_name) catch return null;
-    obj.set(call.ctx.allocator, ptr_property, .{ .int = @intCast(@intFromPtr(ptr)) }) catch return null;
-    obj.set(call.ctx.allocator, type_property, .{ .int = kind }) catch return null;
+    obj.native = .{ .kind = NativeHandle.extensionKind(kind), .ptr = @intFromPtr(ptr) };
     return cell(call, .{ .object = obj });
 }
 
@@ -753,11 +746,7 @@ fn apiResourcePtr(call: *Call, v: ?*const Value, kind: u32) callconv(.c) ?*anyop
     _ = call;
     const value = v orelse return null;
     if (value.* != .object) return null;
-    const stored_kind = value.object.get(type_property);
-    if (stored_kind != .int or stored_kind.int != kind) return null;
-    const ptr = value.object.get(ptr_property);
-    if (ptr != .int or ptr.int == 0) return null;
-    return @ptrFromInt(@as(usize, @intCast(ptr.int)));
+    return value.object.native.get(anyopaque, NativeHandle.extensionKind(kind));
 }
 
 fn collectArgs(buf: []Value, args: ?[*]const ?*const Value, count: usize) ?[]Value {
