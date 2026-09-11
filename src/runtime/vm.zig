@@ -1435,6 +1435,7 @@ pub const VM = struct {
         try @import("../stdlib/gd.zig").register(vm, allocator);
         try @import("../stdlib/soap.zig").register(vm, allocator);
         try @import("../stdlib/mysqli.zig").register(vm, allocator);
+        try @import("../stdlib/chunkutils2.zig").register(vm, allocator);
 
         // HashContext is the type returned by hash_init - register so
         // class_exists('HashContext') and instanceof checks see it
@@ -2415,6 +2416,7 @@ pub const VM = struct {
         @import("../stdlib/ftp.zig").cleanupResources(self.objects);
         @import("../stdlib/ldap.zig").cleanupResources(self.objects);
         @import("../stdlib/mysqli.zig").cleanupConnections(self.objects);
+        @import("../stdlib/chunkutils2.zig").cleanupResources(self.objects);
         // clean up fiber frames before strings/arrays/objects since fiber frames
         // may reference values that get freed by those passes
         for (self.fibers.items) |f| if (!f.pooled) self.cleanupFiberFrames(f);
