@@ -2,7 +2,7 @@
 
 **A high-performance PHP runtime built in Zig.**
 
-zphp is an experimental PHP 8.x-compatible runtime focused on **speed, low memory usage, and modern deployment**. It combines a custom runtime with a built-in HTTP server, WebSocket support, TLS, HTTP/2, database drivers, cURL bindings, package management, testing, formatting, and standalone compilation.
+zphp is an experimental PHP 8.x-compatible runtime focused on **speed, low memory usage, modern deployment, and native concurrency**. It combines a custom runtime with a built-in HTTP server, WebSocket support, TLS, HTTP/2, database drivers, cURL bindings, package management, testing, formatting, and standalone compilation.
 
 Built with **Zig**, zphp is designed to give PHP workloads lower-level control, reduced overhead, and a more performance-oriented runtime architecture.
 
@@ -95,6 +95,81 @@ zig build -Doptimize=ReleaseFast -Dextension=hello.c   # static, compiled into z
 ```
 
 `ZPHP_EXTENSION_DIR` names a directory whose libraries load automatically. Extensions get module, worker, and request lifecycle hooks, a request-local and a worker-local data slot, and a destructor per resource type that runs when the PHP value is unset, goes out of scope, unwinds through an exception, or the request ends. Values cross the boundary as opaque handles, so the runtime's internals can change without breaking compiled extensions; an ABI version in the descriptor rejects mismatches at load time. The static musl release binaries cannot load shared libraries and take static extensions only. `tests/extensions/demo.c` exercises the whole API.
+
+## Worker threads
+
+`Zphp\Pool` runs PHP functions on a fixed set of OS threads, each with its own isolated interpreter. A pool takes a bootstrap script that every worker runs once, so functions, classes, and worker-local state are ready before the first task arrives.
+
+```php
+$pool = new Zphp\Pool(workers: 4, bootstrap: __DIR__ . '/worker.php');
+
+$futures = [];
+foreach ($pages as $page) {
+    $futures[] = $pool->submit('render', [$page]);
+}
+foreach ($futures as $future) {
+    echo $future->await();
+}
+$pool->shutdown();
+```
+
+A task is a closure or a named callable: a function name, `'Class::method'`, or `[$class, $method]`, defined by the bootstrap or built in. Arguments and results are copied between interpreters, so they must be null, bool, int, float, string, arrays of those, or objects of classes both sides define. Generators and handle-backed objects such as PDO connections are refused when submitted, with the offending path in the message.
+
+A closure travels as its compiled code plus its captures: `use` variables, the variables an arrow function reads from the submitting scope, and `$this` when it has one. Each worker loads the code once and runs every later submit of the same closure against it. Captures follow the transfer rules above, and a closure that captures by reference is refused, since nothing can be shared between threads.
+
+```php
+$scale = 0.5;
+$thumbnails = [];
+foreach ($paths as $path) {
+    $thumbnails[] = $pool->submit(function (string $path) use ($scale) {
+        return resize($path, $scale);
+    }, [$path]);
+}
+```
+
+`await()` returns the result, or rethrows the task's exception as the same class when the caller has it. A queued task can be cancelled; a running one sees `Zphp\Task::cancelled()` and stops when it chooses, since nothing is ever killed. The queue is bounded: `submit()` blocks when it is full and `trySubmit()` returns null instead. `collect()` hands back completed futures in completion order, and `readiness()` is a stream that becomes readable when one is waiting, for use with `stream_select()`. `shutdown()` stops accepting work, cancels what is queued, and waits for running tasks; the pool's destructor does the same.
+
+### Channels
+
+`Zphp\Channel` is a bounded queue that workers and the main thread share. A channel passed to a task binds to the same queue on the other side, so a producer and its consumers can run on different threads without sharing PHP memory.
+
+```php
+$jobs = new Zphp\Channel(capacity: 16);
+$results = new Zphp\Channel(capacity: 256);
+
+$consumers = [];
+for ($i = 0; $i < 4; $i++) {
+    $consumers[] = $pool->submit('resize_images', [$jobs, $results]);
+}
+foreach (glob('uploads/*.jpg') as $path) {
+    $jobs->send($path);
+}
+$jobs->close();
+foreach ($consumers as $future) {
+    $future->await();
+}
+$results->close();
+foreach ($results as $thumbnail) {
+    echo $thumbnail, "\n";
+}
+```
+
+```php
+// worker.php
+function resize_images(Zphp\Channel $jobs, Zphp\Channel $results): void
+{
+    foreach ($jobs as $path) {
+        $results->send(resize($path));
+    }
+}
+```
+
+`send()` blocks while the channel is full and `recv()` blocks while it is empty; both take an optional timeout in seconds and throw `Zphp\TimeoutException` when it passes. `trySend()` returns false instead of waiting. `close()` lets buffered values drain and then ends every `foreach`, while `send()` and `recv()` on a closed channel throw `Zphp\ChannelException`. Values follow the same transfer rules as task arguments, and a channel can carry other channels. A channel stays alive while any thread holds it or a value in flight names it.
+
+
+## Related projects
+
+- [zphp-bindings](https://github.com/nexxii04/zphp-bindings): Zig bindings for the extension ABI, so extensions can be written in Zig without C.
 
 ## Project Status
 
