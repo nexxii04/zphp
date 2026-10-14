@@ -2,9 +2,11 @@
 # Differential fuzzing of the date string parser against php: generates random
 # strings from the token families timelib's scanner knows, runs each through
 # strtotime(), modify(), the constructor (zone and errors), and date_parse()
-# under php and zphp, and prints the inputs whose output differs.
+# under php and zphp, and prints the inputs whose output differs. with
+# --formats it instead generates createFromFormat() formats and strings that
+# mostly fit them, and compares date_parse_from_format() and createFromFormat().
 #
-#   scripts/date-fuzz [--count N] [--seed S] [--zphp PATH] [--php CMD] [zone ...]
+#   scripts/date-fuzz [--formats] [--count N] [--seed S] [--zphp PATH] [--php CMD] [zone ...]
 #
 # --php is the reference command, split on spaces. to check against a newer php
 # than the system one, run it in docker with the temp dir mounted at its own path:
@@ -75,6 +77,109 @@ foreach (file($argv[1], FILE_IGNORE_NEW_LINES) as $s) {
 }
 '''
 
+FORMAT_DRIVER = r'''<?php
+$zone = $argv[2];
+date_default_timezone_set($zone);
+foreach (file($argv[1], FILE_IGNORE_NEW_LINES) as $line) {
+    [$f, $s] = json_decode($line);
+    echo '[', $line, "]\n";
+    echo '  parse: ', json_encode(date_parse_from_format($f, $s)), "\n";
+    // without a reset, unset fields come from the clock, so only the zone is stable
+    $fixed = strpbrk($f, '!|U') !== false;
+    $d = DateTimeImmutable::createFromFormat($f, $s, strlen($s) % 2 ? new DateTimeZone('Asia/Kolkata') : null);
+    echo '  create: ', $d === false ? 'false' : $d->format($fixed ? 'Y-m-d H:i:s.u T e U' : 'T e'), ' ', json_encode(DateTimeImmutable::getLastErrors()), "\n";
+}
+'''
+
+DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']
+SEPS = ';:/.,-()'
+NOISE = ['', ' ', 'x', '1', '12', '-', 'Mon', 'jan', '+', 'Z', 'am', '0', '999', '.', '  ', 'T', 'week']
+SPECS = list('djDlSzmnMFYyxXaAgGhHisuveOPpTU!|+#?* -/:.,();') + ['\\T', 'Q', 'T']
+
+
+def case(rng, word):
+    return rng.choice([word, word.upper(), word.capitalize()])
+
+
+def fmt_token(rng, c):
+    r = rng.randint
+    pick = rng.choice
+    if c in 'dj':
+        return pick(['%02d' % r(1, 31), str(r(1, 31)), '%02d' % r(0, 39)])
+    if c == 'D':
+        return case(rng, pick(DAYS)[:3])
+    if c == 'l':
+        return case(rng, pick(DAYS))
+    if c == 'S':
+        return pick(['st', 'nd', 'rd', 'th', 'TH', ''])
+    if c == 'z':
+        return str(r(0, 400))
+    if c in 'mn':
+        return pick(['%02d' % r(1, 12), str(r(1, 12)), str(r(0, 19))])
+    if c == 'M':
+        return case(rng, pick(MONTHS)[:3])
+    if c == 'F':
+        return case(rng, pick(MONTHS + ['sept', 'iv', 'xii']))
+    if c == 'Y':
+        return pick([str(r(1900, 2100)), str(r(0, 99999)), '%04d' % r(0, 9999)])
+    if c == 'y':
+        return pick(['%02d' % r(0, 99), str(r(0, 9)), str(r(100, 999))])
+    if c in 'xX':
+        return pick(['', '+', '-', '--']) + str(r(0, 10 ** r(1, 12)))
+    if c in 'aA':
+        return pick(['am', 'pm', 'AM', 'PM', 'a.m.', 'P.M.', 'p.m', 'a', 'x'])
+    if c in 'gh':
+        return pick([str(r(1, 12)), '%02d' % r(0, 19)])
+    if c in 'GH':
+        return pick([str(r(0, 23)), '%02d' % r(0, 29)])
+    if c in 'is':
+        return pick(['%02d' % r(0, 59), str(r(0, 9)), str(r(60, 99))])
+    if c == 'u':
+        return str(r(0, 10 ** r(1, 7)))
+    if c == 'v':
+        return str(r(0, 10 ** r(1, 4)))
+    if c == 'e':
+        return pick(['UTC', 'Europe/Paris', 'America/New_York', 'Asia/Tokyo', 'europe/paris', 'Mars/Base', '+05:30', 'EST', '(UTC)', 'GMT+3', 'Z'])
+    if c in 'OPp':
+        return pick(['+0200', '-05:00', '+5', 'Z', '+05:30:15', '-0330', '+14:00', '+99:00', 'GMT-1'])
+    if c == 'T':
+        return pick(['EST', 'EDT', 'CEST', 'cet', 'PST', 'UTC', 'A', 'XYZ', 'GMT'])
+    if c == 'U':
+        return pick(['', '-', '+']) + str(r(0, 10 ** r(1, 12)))
+    if c == '#':
+        return pick(list(SEPS) + [' '])
+    if c == '?':
+        return pick(['x', '1', ' ', '-', 'é'])
+    if c == '*':
+        return pick(['abc', 'x', '', 'Foo']) + pick(['', ' ', '-'])
+    if c == ' ':
+        return pick([' ', '', '\t', '  '])
+    if c in SEPS:
+        return c if r(0, 4) else pick(list(SEPS))
+    if c.startswith('\\'):
+        return c[1]
+    if c in '!|+':
+        return ''
+    return c
+
+
+def format_cases(rng, count):
+    import json
+    out = []
+    for _ in range(count):
+        specs = [rng.choice(SPECS) for _ in range(rng.randint(1, 7))]
+        if rng.randint(0, 9) < 7:
+            specs.insert(0, '!')
+        f = ''.join(specs)
+        s = ''
+        for c in specs:
+            s += fmt_token(rng, c) if rng.randint(0, 9) else rng.choice(NOISE)
+        if rng.randint(0, 9) == 0:
+            s += rng.choice(NOISE)
+        out.append(json.dumps([f, s]))
+    return out
+
 
 def blocks(text):
     out = []
@@ -93,12 +198,13 @@ def main():
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--zphp', default=os.path.join(root, 'zig-out', 'bin', 'zphp'))
     ap.add_argument('--php', default='php')
+    ap.add_argument('--formats', action='store_true')
     ap.add_argument('zones', nargs='*', default=['America/New_York', 'Europe/Paris'])
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
-    lines = []
-    for _ in range(args.count):
+    lines = format_cases(rng, args.count) if args.formats else []
+    for _ in range(0 if args.formats else args.count):
         s = ''
         for _ in range(rng.randint(1, 6)):
             s += rng.choice(POOL)
@@ -113,7 +219,7 @@ def main():
         with open(corpus, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
         with open(driver, 'w') as f:
-            f.write(DRIVER)
+            f.write(FORMAT_DRIVER if args.formats else DRIVER)
         for zone in args.zones:
             php = subprocess.run(shlex.split(args.php) + [driver, corpus, zone], capture_output=True).stdout.decode('utf-8', 'replace')
             zphp = subprocess.run([args.zphp, 'run', driver, corpus, zone], capture_output=True).stdout.decode('utf-8', 'replace')

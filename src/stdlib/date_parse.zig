@@ -1927,6 +1927,370 @@ pub fn parse(a: Allocator, input: []const u8, db: TzDb) !Parsed {
     return out;
 }
 
+// ---- parsing against a format (timelib_parse_from_format) ----
+
+const FormatCode = enum {
+    textual_day,
+    day,
+    day_suffix,
+    day_of_year,
+    month,
+    textual_month,
+    year2,
+    year4,
+    year_expanded,
+    hour12,
+    hour24,
+    meridian,
+    minute,
+    second,
+    microsecond,
+    millisecond,
+    whitespace,
+    epoch_seconds,
+    any_separator,
+    separator,
+    reset_all,
+    reset_unset,
+    random_char,
+    escape,
+    skip_to_separator,
+    allow_extra,
+    timezone,
+    literal,
+};
+
+// default_format_map; anything else is a literal
+fn formatCode(c: u8) FormatCode {
+    return switch (c) {
+        '+' => .allow_extra,
+        '#' => .any_separator,
+        'j', 'd' => .day,
+        'z' => .day_of_year,
+        'S' => .day_suffix,
+        'U' => .epoch_seconds,
+        '\\' => .escape,
+        'h', 'g' => .hour12,
+        'H', 'G' => .hour24,
+        'a', 'A' => .meridian,
+        'u' => .microsecond,
+        'v' => .millisecond,
+        'i' => .minute,
+        'n', 'm' => .month,
+        '?' => .random_char,
+        '!' => .reset_all,
+        '|' => .reset_unset,
+        's' => .second,
+        ';', ':', '/', '.', ',', '-', '(', ')' => .separator,
+        '*' => .skip_to_separator,
+        'D', 'l' => .textual_day,
+        'M', 'F' => .textual_month,
+        'e', 'P', 'p', 'T', 'O' => .timezone,
+        ' ' => .whitespace,
+        'y' => .year2,
+        'Y' => .year4,
+        'x', 'X' => .year_expanded,
+        else => .literal,
+    };
+}
+
+// timelib_meridian_with_check: unlike the scanner's meridian, the "m" (and the
+// dots around it) must be there
+fn meridianWithCheck(p: *Ptr, h: i64) i64 {
+    var ret: i64 = 0;
+    while (p.c() != 0 and p.c() != 'A' and p.c() != 'a' and p.c() != 'P' and p.c() != 'p') p.i += 1;
+    if (p.c() == 0) return UNSET;
+    if (p.c() == 'a' or p.c() == 'A') {
+        if (h == 12) ret = -12;
+    } else if (h != 12) {
+        ret = 12;
+    }
+    p.i += 1;
+    if (p.c() == '.') {
+        p.i += 1;
+        if (p.c() != 'm' and p.c() != 'M') return UNSET;
+        p.i += 1;
+        if (p.c() != '.') return UNSET;
+        p.i += 1;
+    } else if (p.c() == 'm' or p.c() == 'M') {
+        p.i += 1;
+    } else {
+        return UNSET;
+    }
+    return ret;
+}
+
+// strchr(set, c) in c also finds the terminating nul
+fn inSetOrNul(set: []const u8, c: u8) bool {
+    return c == 0 or std.mem.indexOfScalar(u8, set, c) != null;
+}
+
+// timelib_unixtime2gmt's fields: the utc wall clock of t.sse
+fn fieldsFromSse(t: *Time, ts: i64) void {
+    const days = @divFloor(ts, 86400);
+    const rem = ts - days *% 86400;
+    dateFromEpochDays(days, &t.y, &t.m, &t.d);
+    t.h = @divTrunc(rem, 3600);
+    t.i = @divTrunc(rem - t.h * 3600, 60);
+    t.s = @rem(rem, 60);
+}
+
+fn resetFields(t: *Time) void {
+    t.y = 1970;
+    t.m = 1;
+    t.d = 1;
+    t.h = 0;
+    t.i = 0;
+    t.s = 0;
+    t.us = 0;
+    t.has_id = false;
+}
+
+fn resetUnsetFields(t: *Time) void {
+    if (t.y == UNSET) t.y = 1970;
+    if (t.m == UNSET) t.m = 1;
+    if (t.d == UNSET) t.d = 1;
+    if (t.h == UNSET) t.h = 0;
+    if (t.i == UNSET) t.i = 0;
+    if (t.s == UNSET) t.s = 0;
+    if (t.us == UNSET) t.us = 0;
+}
+
+// timelib_parse_from_format with php's default format map. the input ends at
+// its first nul, as the c string does. the iso specifiers of other maps don't
+// exist here
+pub fn parseFromFormat(a: Allocator, format: []const u8, input: []const u8, db: TzDb) !Parsed {
+    var out = Parsed{};
+    errdefer out.deinit(a);
+    const t = &out.time;
+    // errors raised inside the number readers carry no token: position 0, no
+    // character
+    const no_tok = [_]u8{0};
+    var s = Scanner{ .a = a, .buf = &no_tok, .len = 0, .t = t, .p = &out, .db = db };
+    var f = Ptr{ .s = format };
+    var p = Ptr{ .s = input };
+    var allow_extra = false;
+
+    const at = struct {
+        fn err(o: *Parsed, al: Allocator, in: *const Ptr, pos: usize, msg: []const u8) !void {
+            try o.errors.append(al, .{ .pos = pos, .char = if (pos < in.s.len) in.s[pos] else 0, .msg = msg });
+        }
+        fn warn(o: *Parsed, al: Allocator, in: *const Ptr, pos: usize, msg: []const u8) !void {
+            try o.warnings.append(al, .{ .pos = pos, .char = if (pos < in.s.len) in.s[pos] else 0, .msg = msg });
+        }
+    };
+
+    while (f.c() != 0 and p.c() != 0) {
+        const begin = p.i;
+        switch (formatCode(f.c())) {
+            .textual_day => {
+                if (lookupRelunit(&p)) |ru| {
+                    t.have_relative = true;
+                    t.relative.have_weekday_relative = true;
+                    t.relative.weekday = ru.mult;
+                    t.relative.weekday_behavior = 1;
+                } else {
+                    try at.err(&out, a, &p, begin, "A textual day could not be found");
+                }
+            },
+            .day => {
+                if (!inSetOrNul("0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                t.d = getNr(&p, 2);
+                if (t.d == UNSET) {
+                    try at.err(&out, a, &p, begin, "A two digit day could not be found");
+                } else t.have_date = 1;
+            },
+            .day_suffix => skipDaySuffix(&p),
+            .day_of_year => {
+                if (!inSetOrNul("0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                if (t.y == UNSET) try at.err(&out, a, &p, begin, "A 'day of year' can only come after a year has been found");
+                const tmp = getNr(&p, 3);
+                if (tmp == UNSET) {
+                    try at.err(&out, a, &p, begin, "A three digit day-of-year could not be found");
+                } else if (t.y != UNSET) {
+                    t.have_date = 1;
+                    t.m = 1;
+                    t.d = tmp + 1;
+                    doNormalize(t);
+                }
+            },
+            .month => {
+                if (!inSetOrNul("0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                t.m = getNr(&p, 2);
+                if (t.m == UNSET) {
+                    try at.err(&out, a, &p, begin, "A two digit month could not be found");
+                } else t.have_date = 1;
+            },
+            .textual_month => {
+                const tmp = lookupMonth(&p);
+                if (tmp == 0) {
+                    try at.err(&out, a, &p, begin, "A textual month could not be found");
+                } else {
+                    t.have_date = 1;
+                    t.m = tmp;
+                }
+            },
+            .year2 => {
+                if (!inSetOrNul("0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                var length: usize = 0;
+                t.y = getNrEx(&p, 2, &length);
+                if (t.y == UNSET) {
+                    try at.err(&out, a, &p, begin, "A two digit year could not be found");
+                } else {
+                    t.have_date = 1;
+                    processYear(&t.y, length);
+                }
+            },
+            .year4 => {
+                if (!inSetOrNul("0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                t.y = getNr(&p, 4);
+                if (t.y == UNSET) {
+                    try at.err(&out, a, &p, begin, "A four digit year could not be found");
+                } else t.have_date = 1;
+            },
+            .year_expanded => {
+                if (!inSetOrNul("+-0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                t.y = try s.getSignedNr(&p, 19);
+                if (t.y == UNSET) {
+                    try at.err(&out, a, &p, begin, "An expanded digit year could not be found");
+                } else t.have_date = 1;
+            },
+            .hour12 => {
+                if (!inSetOrNul("0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                t.h = getNr(&p, 2);
+                if (t.h == UNSET) {
+                    try at.err(&out, a, &p, begin, "A two digit hour could not be found");
+                } else if (t.h > 12) {
+                    try at.err(&out, a, &p, begin, "Hour cannot be higher than 12");
+                } else t.have_time = 1;
+            },
+            .hour24 => {
+                if (!inSetOrNul("0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                t.h = getNr(&p, 2);
+                if (t.h == UNSET) {
+                    try at.err(&out, a, &p, begin, "A two digit hour could not be found");
+                } else t.have_time = 1;
+            },
+            .meridian => {
+                if (t.h == UNSET) try at.err(&out, a, &p, begin, "Meridian can only come after an hour has been found");
+                const tmp = meridianWithCheck(&p, t.h);
+                if (tmp == UNSET) {
+                    try at.err(&out, a, &p, begin, "A meridian could not be found");
+                } else {
+                    t.have_time = 1;
+                    if (t.h != UNSET) t.h += tmp;
+                }
+            },
+            .minute, .second => {
+                const is_min = formatCode(f.c()) == .minute;
+                if (!inSetOrNul("0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                var length: usize = 0;
+                const v = getNrEx(&p, 2, &length);
+                if (v == UNSET or length != 2) {
+                    try at.err(&out, a, &p, begin, if (is_min) "A two digit minute could not be found" else "A two digit second could not be found");
+                } else {
+                    t.have_time = 1;
+                    if (is_min) t.i = v else t.s = v;
+                }
+            },
+            .microsecond, .millisecond => {
+                const micro = formatCode(f.c()) == .microsecond;
+                if (!inSetOrNul("0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                const tptr = p.i;
+                const v = getNr(&p, if (micro) 6 else 3);
+                if (v == UNSET or p.i - tptr < 1) {
+                    try at.err(&out, a, &p, begin, if (micro) "A six digit microsecond could not be found" else "A three digit millisecond could not be found");
+                } else {
+                    // the digit count includes anything skipped before the digits
+                    const scale: i64 = (if (micro) @as(i64, 6) else 3) - @as(i64, @intCast(p.i - tptr));
+                    const fv = @as(f64, @floatFromInt(v)) * std.math.pow(f64, 10, @floatFromInt(scale));
+                    t.us = toInt(if (micro) fv else fv * 1000);
+                }
+            },
+            .whitespace => eatSpaces(&p),
+            .epoch_seconds => {
+                if (!inSetOrNul("+-0123456789", p.c())) try at.err(&out, a, &p, begin, "Unexpected data found.");
+                const tmp = try s.getSignedNr(&p, 24);
+                t.have_zone = 1;
+                t.sse = tmp;
+                t.is_localtime = true;
+                t.zone_type = ZONETYPE_OFFSET;
+                t.z = 0;
+                t.dst = 0;
+                fieldsFromSse(t, tmp);
+            },
+            .any_separator => {
+                if (formatCode(p.c()) != .separator) {
+                    try at.err(&out, a, &p, begin, "The separation symbol ([;:/.,-]) could not be found");
+                } else p.i += 1;
+            },
+            .separator => {
+                if (p.c() != f.c()) {
+                    try at.err(&out, a, &p, begin, "The separation symbol could not be found");
+                } else p.i += 1;
+            },
+            .reset_all => resetFields(t),
+            .reset_unset => resetUnsetFields(t),
+            .random_char => p.i += 1,
+            .escape => blk: {
+                if (f.at(1) == 0) {
+                    try at.err(&out, a, &p, begin, "Escaped character expected");
+                    break :blk;
+                }
+                f.i += 1;
+                if (p.c() != f.c()) {
+                    try at.err(&out, a, &p, begin, "The escaped character could not be found");
+                } else p.i += 1;
+            },
+            .skip_to_separator => {
+                p.i += 1;
+                while (!inSetOrNul(" \t.,:;/-0123456789", p.c())) p.i += 1;
+            },
+            .allow_extra => allow_extra = true,
+            .timezone => {
+                var not_found = false;
+                t.z = parseZoneInto(t, &p, &not_found, db);
+                if (not_found) {
+                    try at.err(&out, a, &p, begin, "The timezone could not be found in the database");
+                } else t.have_zone = 1;
+            },
+            .literal => {
+                if (f.c() != p.c()) try at.err(&out, a, &p, begin, "The format separator does not match");
+                p.i += 1;
+            },
+        }
+        f.i += 1;
+    }
+    if (p.c() != 0) {
+        if (allow_extra) {
+            try at.warn(&out, a, &p, p.i, "Trailing data");
+        } else {
+            try at.err(&out, a, &p, p.i, "Trailing data");
+        }
+    }
+    // trailing reset specifiers are valid
+    while (f.c() != 0) : (f.i += 1) {
+        switch (formatCode(f.c())) {
+            .reset_all => resetFields(t),
+            .reset_unset => resetUnsetFields(t),
+            .allow_extra => {},
+            else => {
+                try at.err(&out, a, &p, p.i, "Not enough data available to satisfy format");
+                break;
+            },
+        }
+    }
+    if (t.h != UNSET or t.i != UNSET or t.s != UNSET or t.us != UNSET) {
+        if (t.h == UNSET) t.h = 0;
+        if (t.i == UNSET) t.i = 0;
+        if (t.s == UNSET) t.s = 0;
+        if (t.us == UNSET) t.us = 0;
+    }
+    if (t.h != UNSET and t.i != UNSET and t.s != UNSET and !validTime(t.h, t.i, t.s)) try at.warn(&out, a, &p, p.i, "The parsed time was invalid");
+    if (t.y != UNSET and t.m != UNSET and t.d != UNSET and !validDate(t.y, t.m, t.d)) try at.warn(&out, a, &p, p.i, "The parsed date was invalid");
+    return out;
+}
+
 // ---- calendar helpers (dow.c) ----
 
 pub fn isLeap(y: i64) bool {
@@ -2243,6 +2607,89 @@ pub fn updateTs(t: *Time, tzi: ?[]const u8, db: TzDb) void {
 }
 
 // the moment a parsed time is resolved against
+// timelib_update_from_sse: the wall-clock fields of t.sse in t's zone
+pub fn updateFromSse(t: *Time, db: TzDb) void {
+    const sse = t.sse;
+    const z = t.z;
+    const dst = t.dst;
+    switch (t.zone_type) {
+        ZONETYPE_ABBR, ZONETYPE_OFFSET => fieldsFromSse(t, sse +% t.z +% t.dst *% 3600),
+        ZONETYPE_ID => fieldsFromSse(t, sse +% (if (t.id()) |id_| info(db, id_, sse).offset else 0)),
+        else => fieldsFromSse(t, sse),
+    }
+    t.sse = sse;
+    t.is_localtime = true;
+    t.have_zone = 1;
+    t.z = z;
+    t.dst = dst;
+}
+
+fn hmsToSeconds(h: i64, i: i64, s: i64) i64 {
+    return h *% 3600 +% i *% 60 +% s;
+}
+
+// the y/m/d/h/i/s/us of an interval as a relative time, with the sign applied
+fn plainRelative(rel: *const Rel, bias: i64) Rel {
+    return .{ .y = rel.y *% bias, .m = rel.m *% bias, .d = rel.d *% bias, .h = rel.h *% bias, .i = rel.i *% bias, .s = rel.s *% bias, .us = rel.us *% bias };
+}
+
+// timelib_add: the interval as a relative time on the wall clock. a weekday
+// or special interval (from a date string) applies whole and ignores invert
+pub fn add(t: *Time, rel: *const Rel, invert: bool, db: TzDb) void {
+    t.relative = if (rel.have_weekday_relative or rel.have_special_relative) rel.* else plainRelative(rel, if (invert) -1 else 1);
+    t.have_relative = true;
+    updateTs(t, null, db);
+    updateFromSse(t, db);
+    t.have_relative = false;
+}
+
+// timelib_sub; the caller refuses weekday and special intervals first
+pub fn sub(t: *Time, rel: *const Rel, invert: bool, db: TzDb) void {
+    t.relative = plainRelative(rel, if (invert) 1 else -1);
+    t.have_relative = true;
+    updateTs(t, null, db);
+    updateFromSse(t, db);
+    t.have_relative = false;
+}
+
+// timelib_add_wall and timelib_sub_wall (sign -1): years, months, and days on
+// the wall clock, then hours, minutes, and seconds as elapsed time
+pub fn addWall(t: *Time, rel: *const Rel, invert: bool, sign: i64, db: TzDb) void {
+    t.have_relative = true;
+    if (rel.have_weekday_relative or rel.have_special_relative) {
+        t.relative = rel.*;
+        updateTs(t, null, db);
+        updateFromSse(t, db);
+    } else {
+        const bias: i64 = if (invert) -1 else 1;
+        t.relative = .{ .y = sign *% rel.y *% bias, .m = sign *% rel.m *% bias, .d = sign *% rel.d *% bias };
+        if (t.relative.y != 0 or t.relative.m != 0 or t.relative.d != 0) updateTs(t, null, db);
+        if (rel.us == 0) {
+            t.sse +%= sign *% bias *% hmsToSeconds(rel.h, rel.i, rel.s);
+            updateFromSse(t, db);
+        } else {
+            var us = rel.us;
+            var secs = rel.s;
+            rangeLimit(0, 1000000, 1000000, &us, &secs);
+            t.sse +%= sign *% bias *% hmsToSeconds(rel.h, rel.i, secs);
+            updateFromSse(t, db);
+            t.us +%= sign *% us *% bias;
+            doNormalize(t);
+            updateTs(t, null, db);
+        }
+        doNormalize(t);
+    }
+    t.have_relative = false;
+}
+
+// date_period_advance: the whole interval as the relative part, invert unused
+pub fn periodAdvance(t: *Time, rel: *const Rel, db: TzDb) void {
+    t.have_relative = true;
+    t.relative = rel.*;
+    updateTs(t, null, db);
+    updateFromSse(t, db);
+}
+
 pub const Now = struct {
     y: i64,
     m: i64,

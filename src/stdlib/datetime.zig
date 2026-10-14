@@ -374,14 +374,18 @@ fn dpGetIterator(ctx: *NativeContext, _: []const Value) RuntimeError!NativeResul
     const start_v = obj.get("__start");
     if (start_v != .object) return NativeResult.scalar(.null);
     var ts = getTimestamp(start_v.object);
+    const start_us = start_v.object.get("__microseconds");
+    var us: i64 = if (start_us == .int) start_us.int else 0;
     if (exclude_start) {
         const di = obj.get("__interval");
         if (di == .object) {
-            const tz_name = objTzName(start_v.object, ctx.vm.default_tz_name);
-            ts = applyIntervalTz(ctx.allocator, ts, di.object, 1, tz_name);
+            const next = try periodStep(ctx, ts, us, objTzName(start_v.object, ctx.vm.default_tz_name), di.object);
+            ts = next.ts;
+            us = next.us;
         }
     }
     try iter.set(ctx.allocator, "__cursor_ts", .{ .int = ts });
+    try iter.set(ctx.allocator, "__cursor_us", .{ .int = us });
     try iter.set(ctx.allocator, "__index", .{ .int = 0 });
     try iter.set(ctx.allocator, "__exclude_start", .{ .bool = exclude_start });
     try iter.set(ctx.allocator, "__include_end", .{ .bool = include_end });
@@ -409,13 +413,18 @@ fn dpiCurrent(ctx: *NativeContext, _: []const Value) RuntimeError!NativeResult {
     const this = getThis(ctx) orelse return NativeResult.scalar(.null);
     if (!dpiTimestampInRange(this)) return NativeResult.scalar(.{ .bool = false });
     const ts = Value.toInt(this.get("__cursor_ts"));
-    const dt = try ctx.createObject("DateTime");
-    try dt.set(ctx.allocator, "timestamp", .{ .int = ts });
     const start_v = this.get("__start");
+    // the current date is a DateTime or DateTimeImmutable, whichever the
+    // start date's class derives from (get_base_date_class)
+    const base: []const u8 = if (start_v == .object and ctx.vm.isInstanceOf(start_v.object.class_name, "DateTimeImmutable")) "DateTimeImmutable" else "DateTime";
+    const dt = try ctx.createObject(base);
+    try dt.set(ctx.allocator, "timestamp", .{ .int = ts });
     if (start_v == .object) {
         const tz = start_v.object.get("__timezone");
         if (tz == .string) try dt.set(ctx.allocator, "__timezone", tz);
     }
+    const us = Value.toInt(this.get("__cursor_us"));
+    if (us != 0) try dt.set(ctx.allocator, "__microseconds", .{ .int = us });
     return NativeResult.borrowed(.{ .object = dt });
 }
 
@@ -428,10 +437,11 @@ fn dpiNext(ctx: *NativeContext, _: []const Value) RuntimeError!NativeResult {
     const this = getThis(ctx) orelse return NativeResult.scalar(.null);
     const di = this.get("__interval");
     if (di == .object) {
-        const cur = Value.toInt(this.get("__cursor_ts"));
         const start_v = this.get("__start");
         const tz_name = if (start_v == .object) objTzName(start_v.object, ctx.vm.default_tz_name) else ctx.vm.default_tz_name;
-        try this.set(ctx.allocator, "__cursor_ts", .{ .int = applyIntervalTz(ctx.allocator, cur, di.object, 1, tz_name) });
+        const next = try periodStep(ctx, Value.toInt(this.get("__cursor_ts")), Value.toInt(this.get("__cursor_us")), tz_name, di.object);
+        try this.set(ctx.allocator, "__cursor_ts", .{ .int = next.ts });
+        try this.set(ctx.allocator, "__cursor_us", .{ .int = next.us });
     }
     const idx = Value.toInt(this.get("__index"));
     try this.set(ctx.allocator, "__index", .{ .int = idx + 1 });
@@ -566,7 +576,7 @@ pub fn formatTimestampTzMicros(ctx: *NativeContext, timestamp: i64, format: []co
                 try buf.appendSlice(a, s);
             },
             'U' => {
-                var tmp: [16]u8 = undefined;
+                var tmp: [24]u8 = undefined;
                 const s = std.fmt.bufPrint(&tmp, "{d}", .{timestamp}) catch "0";
                 try buf.appendSlice(a, s);
             },
@@ -694,14 +704,14 @@ pub fn formatTimestampTzMicros(ctx: *NativeContext, timestamp: i64, format: []co
             },
             'o' => {
                 const week = isoWeek(@intCast(epoch_day.day));
-                var tmp: [8]u8 = undefined;
+                var tmp: [24]u8 = undefined;
                 const s = std.fmt.bufPrint(&tmp, "{d}", .{week.year}) catch "0000";
                 try buf.appendSlice(a, s);
             },
             'X' => {
                 // PHP 8.4: ISO 8601 expanded year with mandatory leading sign,
                 // four-digit minimum
-                var tmp: [12]u8 = undefined;
+                var tmp: [24]u8 = undefined;
                 const yr = year_day.year;
                 const s = if (yr >= 0)
                     std.fmt.bufPrint(&tmp, "+{d:0>4}", .{@as(u64, @intCast(yr))}) catch "+0000"
@@ -712,7 +722,7 @@ pub fn formatTimestampTzMicros(ctx: *NativeContext, timestamp: i64, format: []co
             'x' => {
                 // PHP 8.4: like X but the leading sign is omitted for years
                 // in [0, 9999]
-                var tmp: [12]u8 = undefined;
+                var tmp: [24]u8 = undefined;
                 const yr = year_day.year;
                 const s = if (yr < 0)
                     std.fmt.bufPrint(&tmp, "-{d:0>4}", .{@as(u64, @intCast(-yr))}) catch "-0000"
@@ -798,7 +808,6 @@ fn dtGetTimestamp(ctx: *NativeContext, _: []const Value) RuntimeError!NativeResu
     return NativeResult.scalar(.{ .int = getTimestamp(obj) });
 }
 
-
 fn dtModify(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     const obj = getThis(ctx) orelse return NativeResult.scalar(.null);
     if (args.len == 0 or args[0] != .string) return NativeResult.borrowed(.{ .object = obj });
@@ -814,39 +823,49 @@ fn dtiModify(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult
     return NativeResult.borrowed(.{ .object = new_obj });
 }
 
-// add a DateInterval to a timestamp using calendar arithmetic for y/m/d so
-// month-length variation and 31st-of-month rollover behave like PHP
-fn applyIntervalTz(a: Allocator, ts: i64, interval: *PhpObject, sign: i64, tz_name: []const u8) i64 {
-    const y = Value.toInt(interval.get("y"));
-    const m = Value.toInt(interval.get("m"));
-    const d = Value.toInt(interval.get("d"));
-    const h = Value.toInt(interval.get("h"));
-    const i = Value.toInt(interval.get("i"));
-    const s = Value.toInt(interval.get("s"));
-    const invert = Value.toInt(interval.get("invert"));
-    const direction: i64 = if (invert != 0) -sign else sign;
+// a DateInterval as timelib_rel_time. f holds the microseconds as a float;
+// rounding recovers the integer every native interval was made from. an
+// interval from a date string keeps its weekday and special parts only in the
+// string, so they are read back from it
+const IntervalSpec = struct { rel: dp.Rel, invert: bool, wall: bool };
 
-    // calendar arithmetic for y/m/d happens in the receiver's timezone so
-    // crossing DST doesn't bleed into the wall-clock time
-    const off_in: i64 = tzOffsetForName(a, tz_name, ts);
-    const c = baseComponents(ts + off_in);
-    var year: i64 = c.year + direction * y;
-    var month: i64 = c.month + direction * m;
-    while (month > 12) : ({
-        month -= 12;
-        year += 1;
-    }) {}
-    while (month < 1) : ({
-        month += 12;
-        year -= 1;
-    }) {}
-    const day: i64 = c.day + direction * d;
+fn intervalSpec(ctx: *NativeContext, iv: *PhpObject) RuntimeError!IntervalSpec {
+    var rel = dp.Rel{};
+    if (iv.get("from_string") == .bool and iv.get("from_string").bool and iv.get("date_string") == .string) {
+        var p = try parseDate(ctx, iv.get("date_string").string.bytes());
+        defer p.deinit(ctx.allocator);
+        rel = p.time.relative;
+    }
+    rel.y = Value.toInt(iv.get("y"));
+    rel.m = Value.toInt(iv.get("m"));
+    rel.d = Value.toInt(iv.get("d"));
+    rel.h = Value.toInt(iv.get("h"));
+    rel.i = Value.toInt(iv.get("i"));
+    rel.s = Value.toInt(iv.get("s"));
+    const f = Value.toFloat(iv.get("f"));
+    rel.us = if (f == f and @abs(f) < 9.2e12) @intFromFloat(@round(f * 1e6)) else 0;
+    return .{ .rel = rel, .invert = Value.toInt(iv.get("invert")) != 0, .wall = iv.get("__wall") == .bool and iv.get("__wall").bool };
+}
 
-    var local_ts = dateToTimestamp(year, month, day, c.hour, c.min, c.sec);
-    // convert local back to UTC
-    local_ts -= tzOffsetForWallByName(a, tz_name, local_ts);
-    local_ts += direction * (h * 3600 + i * 60 + s);
-    return local_ts;
+// the object's instant as timelib holds it: wall-clock fields in its zone
+fn objTime(ctx: *NativeContext, obj: *PhpObject) dp.Time {
+    const zone = ParseZone.of(objTzName(obj, ctx.vm.default_tz_name), false);
+    const us_v = obj.get("__microseconds");
+    return wallTime(ctx.allocator, getTimestamp(obj), if (us_v == .int) us_v.int else 0, &zone);
+}
+
+fn storeTime(ctx: *NativeContext, obj: *PhpObject, t: *const dp.Time) RuntimeError!void {
+    const zone = ParseZone.of(objTzName(obj, ctx.vm.default_tz_name), false);
+    try storeInstant(ctx, obj, t.sse, t.us, &zone);
+}
+
+// one DatePeriod step from an instant in a zone
+fn periodStep(ctx: *NativeContext, ts: i64, us: i64, tz_name: []const u8, iv: *PhpObject) RuntimeError!struct { ts: i64, us: i64 } {
+    const spec = try intervalSpec(ctx, iv);
+    const zone = ParseZone.of(tz_name, false);
+    var t = wallTime(ctx.allocator, ts, us, &zone);
+    dp.periodAdvance(&t, &spec.rel, parse_db);
+    return .{ .ts = t.sse, .us = t.us };
 }
 
 // the setters (setDate, setTime, setISODate) work on the wall-clock time in
@@ -895,12 +914,41 @@ fn immutable(comptime f: Mutation) fn (*NativeContext, []const Value) RuntimeErr
 
 fn addOn(ctx: *NativeContext, obj: *PhpObject, args: []const Value) RuntimeError!void {
     if (args.len == 0 or args[0] != .object) return;
-    try obj.set(ctx.allocator, "timestamp", .{ .int = applyIntervalTz(ctx.allocator, getTimestamp(obj), args[0].object, 1, objTzName(obj, ctx.vm.default_tz_name)) });
+    const spec = try intervalSpec(ctx, args[0].object);
+    var t = objTime(ctx, obj);
+    if (spec.wall) dp.addWall(&t, &spec.rel, spec.invert, 1, parse_db) else dp.add(&t, &spec.rel, spec.invert, parse_db);
+    try storeTime(ctx, obj, &t);
 }
 
-fn subOn(ctx: *NativeContext, obj: *PhpObject, args: []const Value) RuntimeError!void {
+// php_date_sub. a weekday or special interval can't be subtracted: the
+// methods throw, date_sub() (no method name) warns
+fn dtSubOn(ctx: *NativeContext, obj: *PhpObject, args: []const Value) RuntimeError!void {
+    return subWith(ctx, obj, args, "DateTime::sub");
+}
+
+fn dtiSubOn(ctx: *NativeContext, obj: *PhpObject, args: []const Value) RuntimeError!void {
+    return subWith(ctx, obj, args, "DateTimeImmutable::sub");
+}
+
+fn subWith(ctx: *NativeContext, obj: *PhpObject, args: []const Value, method: ?[]const u8) RuntimeError!void {
     if (args.len == 0 or args[0] != .object) return;
-    try obj.set(ctx.allocator, "timestamp", .{ .int = applyIntervalTz(ctx.allocator, getTimestamp(obj), args[0].object, -1, objTzName(obj, ctx.vm.default_tz_name)) });
+    const spec = try intervalSpec(ctx, args[0].object);
+    if (spec.rel.have_weekday_relative or spec.rel.have_special_relative) {
+        const what = "Only non-special relative time specifications are supported for subtraction";
+        if (method) |m| {
+            const msg = std.fmt.allocPrint(ctx.allocator, "{s}(): {s}", .{ m, what }) catch return error.OutOfMemory;
+            defer ctx.allocator.free(msg);
+            try ctx.vm.setPendingException("DateInvalidOperationException", msg);
+            return error.RuntimeError;
+        }
+        const msg = std.fmt.allocPrint(ctx.allocator, "date_sub(): {s}", .{what}) catch return error.OutOfMemory;
+        defer ctx.allocator.free(msg);
+        try ctx.vm.emitWarning(msg);
+        return;
+    }
+    var t = objTime(ctx, obj);
+    if (spec.wall) dp.addWall(&t, &spec.rel, spec.invert, -1, parse_db) else dp.sub(&t, &spec.rel, spec.invert, parse_db);
+    try storeTime(ctx, obj, &t);
 }
 
 fn setDateOn(ctx: *NativeContext, obj: *PhpObject, args: []const Value) RuntimeError!void {
@@ -940,7 +988,7 @@ fn setMicrosecondOn(ctx: *NativeContext, obj: *PhpObject, args: []const Value) R
 }
 
 const dtAdd = mutating(addOn);
-const dtSub = mutating(subOn);
+const dtSub = mutating(dtSubOn);
 const dtSetDate = mutating(setDateOn);
 const dtSetTime = mutating(setTimeOn);
 const dtSetISODate = mutating(setISODateOn);
@@ -948,16 +996,13 @@ const dtSetTimestamp = mutating(setTimestampOn);
 const dtSetTimezone = mutating(setTimezoneOn);
 const dtSetMicrosecond = mutating(setMicrosecondOn);
 const dtiAdd = immutable(addOn);
-const dtiSub = immutable(subOn);
+const dtiSub = immutable(dtiSubOn);
 const dtiSetDate = immutable(setDateOn);
 const dtiSetTime = immutable(setTimeOn);
 const dtiSetISODate = immutable(setISODateOn);
 const dtiSetTimestamp = immutable(setTimestampOn);
 const dtiSetTimezone = immutable(setTimezoneOn);
 const dtiSetMicrosecond = immutable(setMicrosecondOn);
-
-
-
 
 fn objMicros(obj: *PhpObject) i64 {
     const v = obj.get("__microseconds");
@@ -991,9 +1036,6 @@ fn diffObjects(ctx: *NativeContext, obj: *PhpObject, other: *PhpObject, absolute
     return NativeResult.borrowed(.{ .object = interval });
 }
 
-
-
-
 // ISO 8601 week date -> Gregorian date: jan 4 always falls in ISO week 1
 // (the iso-week that contains the first Thursday of the year). The Monday
 // of week 1 is jan4 minus (iso_dow_of_jan4 - 1) days, then advance by
@@ -1010,10 +1052,6 @@ fn isoWeekDateToTimestamp(year: i64, week: i64, day_of_week: i64, h: i64, m: i64
     const target_ts = jan4_ts + offset_days * 86400;
     return target_ts + h * 3600 + m * 60 + s;
 }
-
-
-
-
 
 // a float timestamp keeps its sub-second part as microseconds
 fn setTimestampWithFraction(ctx: *NativeContext, obj: *PhpObject, ts: Value) !void {
@@ -1035,7 +1073,7 @@ fn dtCreateFromTimestamp(ctx: *NativeContext, args: []const Value) RuntimeError!
 }
 
 fn dtCreateFromFormat(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
-    return createFromFormatImpl(ctx, args, "DateTime");
+    return createFromFormatImpl(ctx, args, "DateTime", "DateTime::createFromFormat");
 }
 
 fn dtCreateFromImmutable(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
@@ -1070,11 +1108,11 @@ fn dtiCreateFromInterface(ctx: *NativeContext, args: []const Value) RuntimeError
 }
 
 fn native_date_create_from_format(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
-    return createFromFormatImpl(ctx, args, "DateTime");
+    return createFromFormatImpl(ctx, args, "DateTime", "date_create_from_format");
 }
 
 fn native_date_create_immutable_from_format(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
-    return createFromFormatImpl(ctx, args, "DateTimeImmutable");
+    return createFromFormatImpl(ctx, args, "DateTimeImmutable", "date_create_immutable_from_format");
 }
 
 fn createBareDt(ctx: *NativeContext, class_name: []const u8, args: []const Value) RuntimeError!NativeResult {
@@ -1114,7 +1152,7 @@ fn native_date_format(ctx: *NativeContext, args: []const Value) RuntimeError!Nat
 
 // procedural alias for DateInterval::createFromDateString
 fn native_date_interval_create_from_date_string(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
-    return diCreateFromDateString(ctx, args);
+    return intervalFromDateString(ctx, args, false);
 }
 
 // procedural alias for DateInterval::format($interval, $format)
@@ -1138,7 +1176,7 @@ fn applyIntervalProc(ctx: *NativeContext, args: []const Value, sign: i64) Runtim
     const obj = argObj(args) orelse return NativeResult.scalar(.{ .bool = false });
     if (args.len < 2 or args[1] != .object) return NativeResult.borrowed(.{ .object = obj });
     const target = if (isImmutable(obj)) try cloneDateObject(ctx, obj) else obj;
-    if (sign > 0) try addOn(ctx, target, args[1..]) else try subOn(ctx, target, args[1..]);
+    if (sign > 0) try addOn(ctx, target, args[1..]) else try subWith(ctx, target, args[1..], null);
     return NativeResult.borrowed(.{ .object = target });
 }
 
@@ -1198,13 +1236,12 @@ fn native_date_time_set(ctx: *NativeContext, args: []const Value) RuntimeError!N
 }
 
 fn dtiCreateFromFormat(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
-    return createFromFormatImpl(ctx, args, "DateTimeImmutable");
+    return createFromFormatImpl(ctx, args, "DateTimeImmutable", "DateTimeImmutable::createFromFormat");
 }
 
-fn createFromFormatImpl(ctx: *NativeContext, args: []const Value, default_class: []const u8) RuntimeError!NativeResult {
+fn createFromFormatImpl(ctx: *NativeContext, args: []const Value, default_class: []const u8, fn_name: []const u8) RuntimeError!NativeResult {
     if (args.len < 2 or args[0] != .string or args[1] != .string) return NativeResult.scalar(.{ .bool = false });
-    const format = args[0].string.bytes();
-    const datetime = args[1].string.bytes();
+    try rejectNulBytes(ctx, fn_name, 2, "datetime", args[1].string.bytes());
 
     // late static binding: if called from a subclass (e.g. Carbon), create that class
     const class_name = blk: {
@@ -1218,335 +1255,15 @@ fn createFromFormatImpl(ctx: *NativeContext, args: []const Value, default_class:
         break :blk default_class;
     };
 
-    const res = parseDateTimeFormat(format, datetime, std.time.timestamp()) orelse {
-        var rec = vm_mod.DtLastErrors{ .set = true };
-        rec.addError(0, "A four digit year could not be found");
-        rec.addError(datetime.len, "Not enough data available to satisfy format");
-        rec.error_count = 3;
-        ctx.vm.last_dt = rec;
-        return NativeResult.scalar(.{ .bool = false });
-    };
-    ctx.vm.last_dt = .{};
+    const instant = (try resolveDateWith(ctx, args[1].string.bytes(), args[0].string.bytes(), tzArgName(args, 2), false)) orelse return NativeResult.scalar(.{ .bool = false });
     const obj = try ctx.createObject(class_name);
-
-    // optional 3rd arg: DateTimeZone. PHP applies it as the default zone when
-    // the format string didn't already specify one. without this, an explicit
-    // tz arg to createFromFormat was ignored and DST/regional offsets were
-    // wrong (everything treated as UTC)
-    var final_ts = res.ts;
-    var timezone: ?Value.String = null;
-    defer if (timezone) |name| name.release();
-    if (res.tz_offset_seconds) |off| {
-        const sign: u8 = if (off < 0) '-' else '+';
-        const abs: u32 = @intCast(if (off < 0) -off else off);
-        const hh = abs / 3600;
-        const mm = (abs % 3600) / 60;
-        const n = try std.fmt.allocPrint(ctx.allocator, "{c}{d:0>2}:{d:0>2}", .{ sign, hh, mm });
-        timezone = try Value.String.adopt(ctx.allocator, n);
-    } else if (args.len >= 3 and args[2] == .object and std.mem.eql(u8, args[2].object.class_name, "DateTimeZone")) {
-        const nv = args[2].object.get("timezone");
-        if (nv == .string) {
-            nv.string.retain();
-            timezone = nv.string;
-            // adjust timestamp: parseDateTimeFormat returned a UTC-interpreted
-            // ts but the user meant the wall clock in the explicit zone.
-            // subtract the zone's offset at that moment to get the real UTC ts
-            const off: i64 = if (lookupTimezone(nv.string.bytes())) |tz| tzOffsetAt(tz, res.ts) else 0;
-            final_ts = res.ts - off;
-        }
-    }
-    try obj.set(ctx.allocator, "timestamp", .{ .int = final_ts });
-    if (timezone) |name| try obj.set(ctx.allocator, "__timezone", .{ .string = name });
-    if (res.microseconds != 0) try obj.set(ctx.allocator, "__microseconds", .{ .int = res.microseconds });
+    try storeInstant(ctx, obj, instant.ts, instant.us, &instant.zone);
     return NativeResult.borrowed(.{ .object = obj });
-}
-
-const ParsedDateTime = struct { ts: i64, tz_offset_seconds: ?i32, microseconds: i64 = 0 };
-
-// PHP createFromFormat parser. Supports the common specifiers: Y y m n M F d j D l
-// H G h g i s U a A e T P O Z, plus literal escape (\X) and reset markers (! and |).
-// Returns null on parse failure (caller maps to PHP `false`).
-fn parseDateTimeFormat(format: []const u8, datetime: []const u8, now: i64) ?ParsedDateTime {
-    const ncomps = baseComponents(now);
-    var year: i64 = ncomps.year;
-    var month: i64 = ncomps.month;
-    var day: i64 = ncomps.day;
-    var hour: i64 = ncomps.hour;
-    var min: i64 = ncomps.min;
-    var sec: i64 = ncomps.sec;
-    var u_ts: ?i64 = null;
-    var tz_offset: i64 = 0;
-    var tz_parsed: bool = false;
-    var is_pm: ?bool = null;
-    var hour_is_12: bool = false;
-    var microseconds: i64 = 0;
-
-    // PHP `!` reset semantics: track which fields have been parsed so far so `|` can reset the rest
-    var parsed_year = false;
-    var parsed_month = false;
-    var parsed_day = false;
-    var parsed_hour = false;
-    var parsed_min = false;
-    var parsed_sec = false;
-
-    var fi: usize = 0;
-    var di: usize = 0;
-    while (fi < format.len) : (fi += 1) {
-        const c = format[fi];
-        switch (c) {
-            '!' => {
-                year = 1970;
-                month = 1;
-                day = 1;
-                hour = 0;
-                min = 0;
-                sec = 0;
-                parsed_year = true;
-                parsed_month = true;
-                parsed_day = true;
-                parsed_hour = true;
-                parsed_min = true;
-                parsed_sec = true;
-            },
-            '|' => {
-                if (!parsed_year) year = 1970;
-                if (!parsed_month) month = 1;
-                if (!parsed_day) day = 1;
-                if (!parsed_hour) hour = 0;
-                if (!parsed_min) min = 0;
-                if (!parsed_sec) sec = 0;
-            },
-            '\\' => {
-                fi += 1;
-                if (fi >= format.len) return null;
-                if (di >= datetime.len or datetime[di] != format[fi]) return null;
-                di += 1;
-            },
-            'Y' => {
-                if (di + 4 > datetime.len) return null;
-                year = std.fmt.parseInt(i64, datetime[di .. di + 4], 10) catch return null;
-                di += 4;
-                parsed_year = true;
-            },
-            'y' => {
-                if (di + 2 > datetime.len) return null;
-                const yy = std.fmt.parseInt(i64, datetime[di .. di + 2], 10) catch return null;
-                year = if (yy < 70) 2000 + yy else 1900 + yy;
-                di += 2;
-                parsed_year = true;
-            },
-            'm' => {
-                if (di + 2 > datetime.len) return null;
-                month = std.fmt.parseInt(i64, datetime[di .. di + 2], 10) catch return null;
-                di += 2;
-                parsed_month = true;
-            },
-            'n' => {
-                const took = takeDigits(datetime, di, 1, 2) orelse return null;
-                month = took.value;
-                di = took.next;
-                parsed_month = true;
-            },
-            'd' => {
-                if (di + 2 > datetime.len) return null;
-                day = std.fmt.parseInt(i64, datetime[di .. di + 2], 10) catch return null;
-                di += 2;
-                parsed_day = true;
-            },
-            'j' => {
-                const took = takeDigits(datetime, di, 1, 2) orelse return null;
-                day = took.value;
-                di = took.next;
-                parsed_day = true;
-            },
-            'H' => {
-                if (di + 2 > datetime.len) return null;
-                hour = std.fmt.parseInt(i64, datetime[di .. di + 2], 10) catch return null;
-                di += 2;
-                parsed_hour = true;
-            },
-            'G' => {
-                const took = takeDigits(datetime, di, 1, 2) orelse return null;
-                hour = took.value;
-                di = took.next;
-                parsed_hour = true;
-            },
-            'h' => {
-                if (di + 2 > datetime.len) return null;
-                hour = std.fmt.parseInt(i64, datetime[di .. di + 2], 10) catch return null;
-                di += 2;
-                parsed_hour = true;
-                hour_is_12 = true;
-            },
-            'g' => {
-                const took = takeDigits(datetime, di, 1, 2) orelse return null;
-                hour = took.value;
-                di = took.next;
-                parsed_hour = true;
-                hour_is_12 = true;
-            },
-            'i' => {
-                if (di + 2 > datetime.len) return null;
-                min = std.fmt.parseInt(i64, datetime[di .. di + 2], 10) catch return null;
-                di += 2;
-                parsed_min = true;
-            },
-            's' => {
-                if (di + 2 > datetime.len) return null;
-                sec = std.fmt.parseInt(i64, datetime[di .. di + 2], 10) catch return null;
-                di += 2;
-                parsed_sec = true;
-            },
-            'U' => {
-                const start = di;
-                if (di < datetime.len and datetime[di] == '-') di += 1;
-                while (di < datetime.len and datetime[di] >= '0' and datetime[di] <= '9') : (di += 1) {}
-                if (di == start or (di == start + 1 and datetime[start] == '-')) return null;
-                u_ts = std.fmt.parseInt(i64, datetime[start..di], 10) catch return null;
-            },
-            'u' => {
-                const start = di;
-                while (di < datetime.len and di - start < 6 and datetime[di] >= '0' and datetime[di] <= '9') : (di += 1) {}
-                if (di == start) return null;
-                var parsed_u = std.fmt.parseInt(i64, datetime[start..di], 10) catch 0;
-                // pad to 6-digit microsecond resolution (PHP's u is microseconds)
-                var pad = 6 - (di - start);
-                while (pad > 0) : (pad -= 1) parsed_u *= 10;
-                microseconds = parsed_u;
-            },
-            'v' => {
-                const start = di;
-                while (di < datetime.len and di - start < 3 and datetime[di] >= '0' and datetime[di] <= '9') : (di += 1) {}
-                if (di == start) return null;
-                var parsed_v = std.fmt.parseInt(i64, datetime[start..di], 10) catch 0;
-                // v is milliseconds; scale to microseconds
-                var pad = 3 - (di - start);
-                while (pad > 0) : (pad -= 1) parsed_v *= 10;
-                microseconds = parsed_v * 1000;
-            },
-            'a', 'A' => {
-                if (di + 2 > datetime.len) return null;
-                const seg = datetime[di .. di + 2];
-                if (eqlLower(seg, "am")) is_pm = false else if (eqlLower(seg, "pm")) is_pm = true else return null;
-                di += 2;
-            },
-            'M' => {
-                const m = parseShortMonth(datetime[di..]) orelse return null;
-                month = m;
-                di += 3;
-                parsed_month = true;
-            },
-            'F' => {
-                const len = monthNameLen(datetime[di..]);
-                if (len == 0) return null;
-                month = parseMonthName(datetime[di..]) orelse return null;
-                di += len;
-                parsed_month = true;
-            },
-            'D' => {
-                if (di + 3 > datetime.len) return null;
-                di += 3;
-            },
-            'l' => {
-                const len = weekdayNameLen(datetime[di..]) orelse return null;
-                di += len;
-            },
-            'e', 'T' => {
-                // timezone name: consume identifier-ish chars
-                const start = di;
-                while (di < datetime.len and (isAlpha(datetime[di]) or datetime[di] == '/' or datetime[di] == '_' or datetime[di] == '+' or datetime[di] == '-' or (datetime[di] >= '0' and datetime[di] <= '9'))) : (di += 1) {}
-                if (di == start) return null;
-            },
-            'O', 'P' => {
-                // +0200 or +02:00
-                if (di >= datetime.len) return null;
-                const sign: i64 = if (datetime[di] == '+') 1 else if (datetime[di] == '-') -1 else return null;
-                di += 1;
-                if (di + 2 > datetime.len) return null;
-                const hh = std.fmt.parseInt(i64, datetime[di .. di + 2], 10) catch return null;
-                di += 2;
-                var mm: i64 = 0;
-                if (di < datetime.len and datetime[di] == ':') di += 1;
-                if (di + 2 <= datetime.len and datetime[di] >= '0' and datetime[di] <= '9' and datetime[di + 1] >= '0' and datetime[di + 1] <= '9') {
-                    mm = std.fmt.parseInt(i64, datetime[di .. di + 2], 10) catch 0;
-                    di += 2;
-                }
-                tz_offset = sign * (hh * 3600 + mm * 60);
-                tz_parsed = true;
-            },
-            'Z' => {
-                const start = di;
-                if (di < datetime.len and (datetime[di] == '+' or datetime[di] == '-')) di += 1;
-                while (di < datetime.len and datetime[di] >= '0' and datetime[di] <= '9') : (di += 1) {}
-                if (di == start or (di == start + 1 and !isDigit(datetime[start]))) return null;
-                tz_offset = std.fmt.parseInt(i64, datetime[start..di], 10) catch return null;
-                tz_parsed = true;
-            },
-            ' ' => {
-                while (di < datetime.len and datetime[di] == ' ') di += 1;
-            },
-            else => {
-                if (di >= datetime.len or datetime[di] != c) return null;
-                di += 1;
-            },
-        }
-    }
-
-    const parsed_off: ?i32 = if (tz_parsed) @intCast(tz_offset) else null;
-
-    if (u_ts) |ts| return .{ .ts = ts - tz_offset, .tz_offset_seconds = parsed_off, .microseconds = microseconds };
-
-    if (hour_is_12) {
-        if (is_pm) |pm| {
-            if (pm and hour < 12) hour += 12 else if (!pm and hour == 12) hour = 0;
-        }
-    }
-
-    // PHP zeroes unset time components when ANY time component is parsed.
-    // Without this, an "Y-m-d H:i" format would leave seconds at current time.
-    const any_time_parsed = parsed_hour or parsed_min or parsed_sec;
-    if (any_time_parsed) {
-        if (!parsed_hour) hour = 0;
-        if (!parsed_min) min = 0;
-        if (!parsed_sec) sec = 0;
-    }
-
-    return .{ .ts = dateToTimestamp(year, month, day, hour, min, sec) - tz_offset, .tz_offset_seconds = parsed_off, .microseconds = microseconds };
 }
 
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
-fn isAlpha(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
-}
-
-fn takeDigits(s: []const u8, start: usize, min_n: usize, max_n: usize) ?struct { value: i64, next: usize } {
-    var i = start;
-    while (i < s.len and i - start < max_n and isDigit(s[i])) : (i += 1) {}
-    const got = i - start;
-    if (got < min_n) return null;
-    const v = std.fmt.parseInt(i64, s[start..i], 10) catch return null;
-    return .{ .value = v, .next = i };
-}
-
-fn parseShortMonth(s: []const u8) ?i64 {
-    const months = [_][]const u8{ "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec" };
-    if (s.len < 3) return null;
-    for (months, 1..) |name, i| {
-        if (eqlLower(s[0..3], name)) return @intCast(i);
-    }
-    return null;
-}
-
-fn weekdayNameLen(s: []const u8) ?usize {
-    const days = [_][]const u8{ "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday" };
-    for (days) |name| {
-        if (s.len >= name.len and eqlLower(s[0..name.len], name)) return name.len;
-    }
-    return null;
-}
-
 fn dtiCreateFromTimestamp(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     if (args.len == 0) return NativeResult.scalar(.null);
     const obj = try ctx.createObject("DateTimeImmutable");
@@ -1560,7 +1277,6 @@ fn dtGetMicrosecond(ctx: *NativeContext, _: []const Value) RuntimeError!NativeRe
     if (v == .int) return NativeResult.scalar(v);
     return NativeResult.scalar(.{ .int = 0 });
 }
-
 
 fn dtGetTimezone(ctx: *NativeContext, _: []const Value) RuntimeError!NativeResult {
     const obj = getThis(ctx) orelse return NativeResult.scalar(.null);
@@ -1578,8 +1294,6 @@ fn dtGetOffset(ctx: *NativeContext, _: []const Value) RuntimeError!NativeResult 
     return NativeResult.scalar(.{ .int = @intCast(tzOffsetForName(ctx.allocator, tz_name, ts)) });
 }
 
-
-
 fn extractTimezoneName(args: []const Value) []const u8 {
     if (args.len == 0) return "UTC";
     if (args[0] == .string) return args[0].string.bytes();
@@ -1590,9 +1304,19 @@ fn extractTimezoneName(args: []const Value) []const u8 {
     return "UTC";
 }
 
+// Z_PARAM_PATH: php rejects a string argument with a nul byte in it
+fn rejectNulBytes(ctx: *NativeContext, fn_name: []const u8, pos: usize, param: []const u8, v: []const u8) RuntimeError!void {
+    if (std.mem.indexOfScalar(u8, v, 0) == null) return;
+    const msg = std.fmt.allocPrint(ctx.allocator, "{s}(): Argument #{d} (${s}) must not contain any null bytes", .{ fn_name, pos, param }) catch return error.OutOfMemory;
+    defer ctx.allocator.free(msg);
+    try ctx.vm.setPendingException("ValueError", msg);
+    return error.RuntimeError;
+}
+
 fn dtzConstruct(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     const obj = getThis(ctx) orelse return NativeResult.scalar(.null);
     if (args.len >= 1 and args[0] == .string) {
+        try rejectNulBytes(ctx, "DateTimeZone::__construct", 1, "timezone", args[0].string.bytes());
         const zone = (try timezoneInitialize(ctx, args[0].string.bytes(), "DateTimeZone::__construct(): ", true)) orelse return error.RuntimeError;
         try obj.setCopiedString(ctx.allocator, "timezone", zone.name());
     }
@@ -2018,250 +1742,10 @@ fn native_date_parse(ctx: *NativeContext, args: []const Value) RuntimeError!Nati
 
 fn native_date_parse_from_format(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     if (args.len < 2 or args[0] != .string or args[1] != .string) return NativeResult.scalar(.{ .bool = false });
-    const format = args[0].string.bytes();
-    const datetime = args[1].string.bytes();
-
-    var year: ?i64 = null;
-    var month: ?i64 = null;
-    var day: ?i64 = null;
-    var hour: ?i64 = null;
-    var minute: ?i64 = null;
-    var second: ?i64 = null;
-    var fraction: ?f64 = null;
-    var is_pm: ?bool = null;
-    var hour_is_12: bool = false;
-
-    var errors_buf: [16][]const u8 = undefined;
-    var n_errors: usize = 0;
-
-    var fi: usize = 0;
-    var di: usize = 0;
-    while (fi < format.len) : (fi += 1) {
-        const c = format[fi];
-        switch (c) {
-            'Y' => {
-                if (di + 4 <= datetime.len) {
-                    if (std.fmt.parseInt(i64, datetime[di .. di + 4], 10)) |v| {
-                        year = v;
-                        di += 4;
-                    } else |_| {
-                        if (n_errors < errors_buf.len) {
-                            errors_buf[n_errors] = "A four digit year could not be found";
-                            n_errors += 1;
-                        }
-                    }
-                } else if (n_errors < errors_buf.len) {
-                    errors_buf[n_errors] = "A four digit year could not be found";
-                    n_errors += 1;
-                }
-            },
-            'y' => {
-                if (di + 2 <= datetime.len) {
-                    if (std.fmt.parseInt(i64, datetime[di .. di + 2], 10)) |yy| {
-                        year = if (yy < 70) 2000 + yy else 1900 + yy;
-                        di += 2;
-                    } else |_| {}
-                }
-            },
-            'm' => {
-                if (di + 2 <= datetime.len) {
-                    if (std.fmt.parseInt(i64, datetime[di .. di + 2], 10)) |v| {
-                        month = v;
-                        di += 2;
-                    } else |_| {}
-                }
-            },
-            'n' => {
-                if (takeDigits(datetime, di, 1, 2)) |t| {
-                    month = t.value;
-                    di = t.next;
-                }
-            },
-            'd' => {
-                if (di + 2 <= datetime.len) {
-                    if (std.fmt.parseInt(i64, datetime[di .. di + 2], 10)) |v| {
-                        day = v;
-                        di += 2;
-                    } else |_| {}
-                }
-            },
-            'j' => {
-                if (takeDigits(datetime, di, 1, 2)) |t| {
-                    day = t.value;
-                    di = t.next;
-                }
-            },
-            'H' => {
-                if (di + 2 <= datetime.len) {
-                    if (std.fmt.parseInt(i64, datetime[di .. di + 2], 10)) |v| {
-                        hour = v;
-                        di += 2;
-                    } else |_| {}
-                }
-            },
-            'G' => {
-                if (takeDigits(datetime, di, 1, 2)) |t| {
-                    hour = t.value;
-                    di = t.next;
-                }
-            },
-            'h' => {
-                if (di + 2 <= datetime.len) {
-                    if (std.fmt.parseInt(i64, datetime[di .. di + 2], 10)) |v| {
-                        hour = v;
-                        di += 2;
-                        hour_is_12 = true;
-                    } else |_| {}
-                }
-            },
-            'g' => {
-                if (takeDigits(datetime, di, 1, 2)) |t| {
-                    hour = t.value;
-                    di = t.next;
-                    hour_is_12 = true;
-                }
-            },
-            'i' => {
-                if (di + 2 <= datetime.len) {
-                    if (std.fmt.parseInt(i64, datetime[di .. di + 2], 10)) |v| {
-                        minute = v;
-                        di += 2;
-                    } else |_| {}
-                }
-            },
-            's' => {
-                if (di + 2 <= datetime.len) {
-                    if (std.fmt.parseInt(i64, datetime[di .. di + 2], 10)) |v| {
-                        second = v;
-                        di += 2;
-                    } else |_| {}
-                }
-            },
-            'u' => {
-                // microseconds, variable digits
-                var end = di;
-                while (end < datetime.len and datetime[end] >= '0' and datetime[end] <= '9') end += 1;
-                if (end > di) {
-                    const us = std.fmt.parseInt(i64, datetime[di..end], 10) catch 0;
-                    const digits = end - di;
-                    var divisor: f64 = 1;
-                    var dd: usize = 0;
-                    while (dd < digits) : (dd += 1) divisor *= 10;
-                    fraction = @as(f64, @floatFromInt(us)) / divisor;
-                    di = end;
-                }
-            },
-            'v' => {
-                // milliseconds 3 digits
-                if (di + 3 <= datetime.len) {
-                    if (std.fmt.parseInt(i64, datetime[di .. di + 3], 10)) |ms| {
-                        fraction = @as(f64, @floatFromInt(ms)) / 1000.0;
-                        di += 3;
-                    } else |_| {}
-                }
-            },
-            'a', 'A' => {
-                if (di + 2 <= datetime.len) {
-                    const tok = datetime[di .. di + 2];
-                    if (std.ascii.eqlIgnoreCase(tok, "am")) {
-                        is_pm = false;
-                        di += 2;
-                    } else if (std.ascii.eqlIgnoreCase(tok, "pm")) {
-                        is_pm = true;
-                        di += 2;
-                    }
-                }
-            },
-            'D', 'l' => {
-                // skip alphabetic day name
-                while (di < datetime.len and std.ascii.isAlphabetic(datetime[di])) di += 1;
-            },
-            'M', 'F' => {
-                // month name - look up
-                var end = di;
-                while (end < datetime.len and std.ascii.isAlphabetic(datetime[end])) end += 1;
-                if (end > di) {
-                    const name = datetime[di..end];
-                    const months = [_][]const u8{ "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december" };
-                    for (months, 0..) |mn, idx| {
-                        if (std.ascii.startsWithIgnoreCase(mn, name) and (name.len == mn.len or name.len == 3)) {
-                            month = @intCast(idx + 1);
-                            break;
-                        }
-                    }
-                    di = end;
-                }
-            },
-            ' ', '\t' => {
-                while (di < datetime.len and (datetime[di] == ' ' or datetime[di] == '\t')) di += 1;
-            },
-            '\\' => {
-                fi += 1;
-                if (fi < format.len and di < datetime.len and datetime[di] == format[fi]) di += 1;
-            },
-            '!' => {
-                if (year == null) year = 1970;
-                if (month == null) month = 1;
-                if (day == null) day = 1;
-                if (hour == null) hour = 0;
-                if (minute == null) minute = 0;
-                if (second == null) second = 0;
-                if (fraction == null) fraction = 0;
-            },
-            '|' => {
-                if (year == null) year = 1970;
-                if (month == null) month = 1;
-                if (day == null) day = 1;
-                if (hour == null) hour = 0;
-                if (minute == null) minute = 0;
-                if (second == null) second = 0;
-            },
-            else => {
-                // literal char: PHP advances input if it matches; mismatches
-                // are silent (no errors row) for ordinary punctuation
-                if (di < datetime.len and datetime[di] == c) di += 1;
-            },
-        }
-    }
-
-    if (hour_is_12) {
-        if (is_pm) |pm| {
-            if (pm and (hour orelse 0) < 12) hour = (hour orelse 0) + 12 else if (!pm and (hour orelse 0) == 12) hour = 0;
-        }
-    }
-
-    // PHP: if any time component was parsed, the other time components default
-    // to 0 (rather than remaining unset). hour-implies-min-sec-fraction-min,
-    // etc. all of h/m/s/fraction become 0 when ANY time field is touched
-    const any_time = hour != null or minute != null or second != null or fraction != null;
-    if (any_time) {
-        if (hour == null) hour = 0;
-        if (minute == null) minute = 0;
-        if (second == null) second = 0;
-        if (fraction == null) fraction = 0;
-    }
-
-    return buildDateParseResultOpt(ctx, year, month, day, hour, minute, second, fraction, errors_buf[0..n_errors]);
-}
-
-fn buildDateParseResultOpt(ctx: *NativeContext, year: ?i64, month: ?i64, day: ?i64, hour: ?i64, minute: ?i64, second: ?i64, fraction: ?f64, errors: []const []const u8) RuntimeError!NativeResult {
-    var arr = try ctx.createArray();
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("year") }, if (year) |y| .{ .int = y } else .{ .bool = false });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("month") }, if (month) |m| .{ .int = m } else .{ .bool = false });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("day") }, if (day) |d| .{ .int = d } else .{ .bool = false });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("hour") }, if (hour) |h| .{ .int = h } else .{ .bool = false });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("minute") }, if (minute) |m| .{ .int = m } else .{ .bool = false });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("second") }, if (second) |s| .{ .int = s } else .{ .bool = false });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("fraction") }, if (fraction) |f| .{ .float = f } else .{ .bool = false });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("warning_count") }, .{ .int = 0 });
-    const warns = try ctx.vm.allocArray();
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("warnings") }, .{ .array = warns });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("error_count") }, .{ .int = @intCast(errors.len) });
-    const errs = try ctx.vm.allocArray();
-    for (errors, 0..) |e, i| try errs.set(ctx.allocator, .{ .int = @intCast(i) }, .{ .string = Value.String.borrowed(e) });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("errors") }, .{ .array = errs });
-    try arr.set(ctx.allocator, .{ .string = Value.String.borrowed("is_localtime") }, .{ .bool = false });
-    return NativeResult.borrowed(.{ .array = arr });
+    try rejectNulBytes(ctx, "date_parse_from_format", 2, "datetime", args[1].string.bytes());
+    var p = dp.parseFromFormat(ctx.allocator, args[0].string.bytes(), args[1].string.bytes(), parse_db) catch return error.OutOfMemory;
+    defer p.deinit(ctx.allocator);
+    return parsedTimeArray(ctx, &p);
 }
 
 fn native_getdate(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
@@ -2372,14 +1856,16 @@ const IsoWeek = struct { year: i64, week: u32 };
 fn isoWeek(day_num: i64) IsoWeek {
     // iso 8601 week-numbering: week 1 contains the year's first Thursday.
     // the iso year is the calendar year of the Thursday in the same week.
-    const dow = @mod(day_num + 3, 7); // 0=mon
-    const thu = day_num + 3 - dow;
-    const thu_secs = thu * 86400;
-    const thu_dc = baseComponents(thu_secs);
-    const jan1_ts = dateToTimestamp(thu_dc.year, 1, 1, 0, 0, 0);
-    const jan1_day = @divFloor(jan1_ts, 86400);
-    const week_num: u32 = @intCast(@divFloor(thu - jan1_day, 7) + 1);
-    return .{ .year = thu_dc.year, .week = week_num };
+    // counted in days, so the extreme years php can hold don't overflow
+    const dow = @mod(@mod(day_num, 7) + 3, 7); // 0 is monday; 1970-01-01 was a thursday
+    const thu = day_num +% 3 -% dow;
+    var t = dp.Time{ .m = 1, .d = 1 };
+    var m: i64 = 0;
+    var d: i64 = 0;
+    dp.dateFromEpochDays(thu, &t.y, &m, &d);
+    const jan1_day = dp.epochDaysFromTime(&t);
+    const week_num: u32 = @intCast(@divFloor(thu -% jan1_day, 7) + 1);
+    return .{ .year = t.y, .week = week_num };
 }
 
 fn baseComponents(base: i64) DateComponents {
@@ -2406,22 +1892,6 @@ fn baseComponents(base: i64) DateComponents {
         .min = @divFloor(@mod(sod, 3600), 60),
         .sec = @mod(sod, 60),
     };
-}
-
-fn parseMonthName(s: []const u8) ?i64 {
-    const months = [_][]const u8{ "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december" };
-    for (months, 1..) |name, i| {
-        if (s.len >= name.len and eqlLower(s[0..name.len], name)) return @intCast(i);
-    }
-    return null;
-}
-
-fn monthNameLen(s: []const u8) usize {
-    const months = [_][]const u8{ "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december" };
-    for (months) |name| {
-        if (s.len >= name.len and eqlLower(s[0..name.len], name)) return name.len;
-    }
-    return 0;
 }
 
 fn eqlLower(a: []const u8, lower_b: []const u8) bool {
@@ -3329,10 +2799,6 @@ fn parseTimezoneOffset(s: []const u8) ?i64 {
     return null;
 }
 
-fn startsWith(s: []const u8, prefix: []const u8) bool {
-    return s.len >= prefix.len and std.mem.eql(u8, s[0..prefix.len], prefix);
-}
-
 // gmdate is identical to date since zphp timestamps are always UTC
 fn native_gmdate(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     if (args.len == 0 or args[0] != .string) return NativeResult.literal("");
@@ -3376,6 +2842,7 @@ fn native_timezone_offset_get(_: *NativeContext, args: []const Value) RuntimeErr
 
 fn native_timezone_open(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
     if (args.len < 1 or args[0] != .string) return NativeResult.scalar(.{ .bool = false });
+    try rejectNulBytes(ctx, "timezone_open", 1, "timezone", args[0].string.bytes());
     const zone = (try timezoneInitialize(ctx, args[0].string.bytes(), "timezone_open(): ", false)) orelse return NativeResult.scalar(.{ .bool = false });
     const obj = try ctx.createObject("DateTimeZone");
     try obj.setCopiedString(ctx.allocator, "timezone", zone.name());
@@ -3556,78 +3023,57 @@ fn diConstruct(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResu
     }
     try obj.set(ctx.allocator, "invert", .{ .int = 0 });
     try obj.set(ctx.allocator, "days", .{ .bool = false });
+    // intervals from a duration add hours, minutes, and seconds as elapsed
+    // time (timelib_add_wall); the others add on the wall clock
+    try obj.set(ctx.allocator, "__wall", .{ .bool = true });
     return NativeResult.scalar(.null);
 }
 
 fn diCreateFromDateString(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
+    return intervalFromDateString(ctx, args, true);
+}
+
+// date_interval_create_from_date_string: the relative part of a date string.
+// a parse error or a date, time, or zone in the string throws from the method
+// and warns from the function
+fn intervalFromDateString(ctx: *NativeContext, args: []const Value, throws: bool) RuntimeError!NativeResult {
     if (args.len == 0 or args[0] != .string) return NativeResult.scalar(.{ .bool = false });
-    const dur = parseRelativeDuration(args[0].string.bytes());
+    const input = args[0].string.bytes();
+    var p = try parseDate(ctx, input);
+    defer p.deinit(ctx.allocator);
+    const t = &p.time;
+    var msg: ?[]u8 = null;
+    defer if (msg) |m| ctx.allocator.free(m);
+    if (p.errors.items.len > 0) {
+        const e = p.errors.items[0];
+        msg = std.fmt.allocPrint(ctx.allocator, "Unknown or bad format ({s}) at position {d} ({c}): {s}", .{ input, e.pos, if (e.char == 0) ' ' else e.char, e.msg }) catch return error.OutOfMemory;
+    } else if (t.have_date != 0 or t.have_time != 0 or t.have_zone != 0) {
+        msg = std.fmt.allocPrint(ctx.allocator, "String '{s}' contains non-relative elements", .{input}) catch return error.OutOfMemory;
+    }
+    if (msg) |m| {
+        if (throws) {
+            try ctx.vm.setPendingException("DateMalformedIntervalStringException", m);
+            return error.RuntimeError;
+        }
+        const w = std.fmt.allocPrint(ctx.allocator, "date_interval_create_from_date_string(): {s}", .{m}) catch return error.OutOfMemory;
+        defer ctx.allocator.free(w);
+        try ctx.vm.emitWarning(w);
+        return NativeResult.scalar(.{ .bool = false });
+    }
+    const r = &t.relative;
     const obj = try ctx.createObject("DateInterval");
-    try obj.set(ctx.allocator, "y", .{ .int = dur.y });
-    try obj.set(ctx.allocator, "m", .{ .int = dur.m });
-    try obj.set(ctx.allocator, "d", .{ .int = dur.d });
-    try obj.set(ctx.allocator, "h", .{ .int = dur.h });
-    try obj.set(ctx.allocator, "i", .{ .int = dur.mi });
-    try obj.set(ctx.allocator, "s", .{ .int = dur.s });
-    try obj.set(ctx.allocator, "f", .{ .float = 0 });
+    try obj.set(ctx.allocator, "y", .{ .int = r.y });
+    try obj.set(ctx.allocator, "m", .{ .int = r.m });
+    try obj.set(ctx.allocator, "d", .{ .int = r.d });
+    try obj.set(ctx.allocator, "h", .{ .int = r.h });
+    try obj.set(ctx.allocator, "i", .{ .int = r.i });
+    try obj.set(ctx.allocator, "s", .{ .int = r.s });
+    try obj.set(ctx.allocator, "f", .{ .float = @as(f64, @floatFromInt(r.us)) / 1000000.0 });
     try obj.set(ctx.allocator, "invert", .{ .int = 0 });
     try obj.set(ctx.allocator, "days", .{ .bool = false });
+    try obj.set(ctx.allocator, "from_string", .{ .bool = true });
+    try obj.setCopiedString(ctx.allocator, "date_string", input);
     return NativeResult.borrowed(.{ .object = obj });
-}
-
-const RelDuration = struct { y: i64 = 0, m: i64 = 0, d: i64 = 0, h: i64 = 0, mi: i64 = 0, s: i64 = 0 };
-
-fn parseRelativeDuration(input: []const u8) RelDuration {
-    var out = RelDuration{};
-    var i: usize = 0;
-    while (i < input.len) {
-        while (i < input.len and (input[i] == ' ' or input[i] == '\t')) : (i += 1) {}
-        if (i >= input.len) break;
-
-        // optional sign
-        var sign: i64 = 1;
-        if (input[i] == '+' or input[i] == '-') {
-            if (input[i] == '-') sign = -1;
-            i += 1;
-        }
-
-        // digits
-        const num_start = i;
-        while (i < input.len and isDigit(input[i])) : (i += 1) {}
-        if (i == num_start) {
-            // not a number — skip a token to make progress
-            while (i < input.len and input[i] != ' ' and input[i] != '\t') : (i += 1) {}
-            continue;
-        }
-        const value = sign * (std.fmt.parseInt(i64, input[num_start..i], 10) catch 0);
-
-        // optional whitespace before unit
-        while (i < input.len and (input[i] == ' ' or input[i] == '\t')) : (i += 1) {}
-
-        // unit
-        const unit_start = i;
-        while (i < input.len and isAlpha(input[i])) : (i += 1) {}
-        const unit = input[unit_start..i];
-        if (unit.len == 0) continue;
-
-        // check for trailing " ago" which inverts the value
-        var save_i = i;
-        while (save_i < input.len and (input[save_i] == ' ' or input[save_i] == '\t')) : (save_i += 1) {}
-        var v = value;
-        if (save_i + 3 <= input.len and eqlLower(input[save_i .. save_i + 3], "ago")) {
-            v = -v;
-            i = save_i + 3;
-        }
-
-        if (matchUnit(unit, "year")) out.y += v else if (matchUnit(unit, "month")) out.m += v else if (matchUnit(unit, "week")) out.d += v * 7 else if (matchUnit(unit, "day")) out.d += v else if (matchUnit(unit, "hour")) out.h += v else if (matchUnit(unit, "minute") or matchUnit(unit, "min")) out.mi += v else if (matchUnit(unit, "second") or matchUnit(unit, "sec")) out.s += v;
-    }
-    return out;
-}
-
-fn matchUnit(actual: []const u8, base: []const u8) bool {
-    if (eqlLower(actual, base)) return true;
-    if (actual.len == base.len + 1 and (actual[actual.len - 1] == 's' or actual[actual.len - 1] == 'S') and eqlLower(actual[0..base.len], base)) return true;
-    return false;
 }
 
 fn diFormat(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult {
@@ -3979,9 +3425,18 @@ fn storeInstant(ctx: *NativeContext, obj: *PhpObject, ts: i64, us: i64, zone: *c
 // call fail. tz_arg is the DateTimeZone argument's zone name
 const Instant = struct { ts: i64, us: i64, zone: ParseZone };
 
-fn resolveDate(ctx: *NativeContext, input_arg: []const u8, tz_arg: ?[]const u8, throws: bool) RuntimeError!?Instant {
-    const input = if (input_arg.len == 0) "now" else input_arg;
-    var p = try parseDate(ctx, input);
+fn resolveDate(ctx: *NativeContext, input: []const u8, tz_arg: ?[]const u8, throws: bool) RuntimeError!?Instant {
+    return resolveDateWith(ctx, input, null, tz_arg, throws);
+}
+
+// with a format, the string is read by timelib_parse_from_format and unset
+// time fields come from now instead of midnight (createFromFormat)
+fn resolveDateWith(ctx: *NativeContext, input_arg: []const u8, format: ?[]const u8, tz_arg: ?[]const u8, throws: bool) RuntimeError!?Instant {
+    const input = if (input_arg.len == 0 and format == null) "now" else input_arg;
+    var p = if (format) |f|
+        dp.parseFromFormat(ctx.allocator, f, input, parse_db) catch return error.OutOfMemory
+    else
+        try parseDate(ctx, input);
     defer p.deinit(ctx.allocator);
     recordLastErrors(ctx, &p);
     if (p.errors.items.len > 0) {
@@ -3999,9 +3454,9 @@ fn resolveDate(ctx: *NativeContext, input_arg: []const u8, tz_arg: ?[]const u8, 
     else
         ParseZone.of(ctx.vm.default_tz_name, true);
     const now_t = currentTimeMicros();
-    if (std.mem.eql(u8, input, "now")) return .{ .ts = now_t.ts, .us = now_t.us, .zone = zone };
+    if (format == null and std.mem.eql(u8, input, "now")) return .{ .ts = now_t.ts, .us = now_t.us, .zone = zone };
     const now = nowOf(ctx.allocator, now_t.ts, now_t.us, &zone);
-    dp.fillHoles(&p.time, &now, false);
+    dp.fillHoles(&p.time, &now, format != null);
     dp.updateTs(&p.time, if (zone.kind == dp.ZONETYPE_ID) zone.name() else null, parse_db);
     return .{ .ts = p.time.sse, .us = p.time.us, .zone = ParseZone.ofTime(&p.time) };
 }
