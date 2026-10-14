@@ -22,7 +22,7 @@ echo "error: '" . curl_error($ch) . "'\n";
 echo "errno: " . curl_errno($ch) . "\n";
 
 // test curl_setopt
-echo "setopt url: " . (curl_setopt($ch, CURLOPT_URL, "http://example.com") ? "true" : "false") . "\n";
+echo "setopt url: " . (curl_setopt($ch, CURLOPT_URL, "http://example.com/") ? "true" : "false") . "\n";
 echo "setopt rt: " . (curl_setopt($ch, CURLOPT_RETURNTRANSFER, true) ? "true" : "false") . "\n";
 echo "setopt timeout: " . (curl_setopt($ch, CURLOPT_TIMEOUT, 5) ? "true" : "false") . "\n";
 echo "setopt ua: " . (curl_setopt($ch, CURLOPT_USERAGENT, "TestAgent/1.0") ? "true" : "false") . "\n";

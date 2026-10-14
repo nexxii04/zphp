@@ -2,12 +2,12 @@
 $ch = curl_init();
 echo $ch !== false ? "ok" : "no", "\n";
 
-curl_setopt($ch, CURLOPT_URL, "http://example.com");
+curl_setopt($ch, CURLOPT_URL, "http://example.com/");
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 echo curl_getinfo($ch, CURLINFO_EFFECTIVE_URL), "\n";
 
 curl_setopt_array($ch, [
-    CURLOPT_URL => "http://test.com",
+    CURLOPT_URL => "http://test.com/",
     CURLOPT_TIMEOUT => 30,
     CURLOPT_USERAGENT => "zphp-test",
 ]);
@@ -15,7 +15,7 @@ echo curl_getinfo($ch, CURLINFO_EFFECTIVE_URL), "\n";
 echo curl_error($ch), "|\n";
 echo curl_errno($ch), "\n";
 
-$ch2 = curl_init("http://example.com");
+$ch2 = curl_init("http://example.com/");
 echo curl_getinfo($ch2, CURLINFO_EFFECTIVE_URL), "\n";
 
 $ch3 = curl_init();

@@ -1,9 +1,10 @@
 <?php
-// before a transfer the effective url is the url as set, whatever libcurl
-// would normalize it to; curl_copy_handle keeps options and its own headers
-$ch = curl_init('http://example.com');
+// curl_copy_handle keeps the url and options, and the copy outlives the
+// original with its own header list. urls are already normalized, since
+// libcurl 8.23 adds the trailing slash before a transfer and older ones don't
+$ch = curl_init('http://example.com/');
 echo curl_getinfo($ch, CURLINFO_EFFECTIVE_URL), '|', curl_getinfo($ch)['url'], "\n";
-curl_setopt($ch, CURLOPT_URL, 'http://test.com');
+curl_setopt($ch, CURLOPT_URL, 'http://test.com/');
 echo curl_getinfo($ch, CURLINFO_EFFECTIVE_URL), "\n";
 echo curl_getinfo(curl_copy_handle($ch), CURLINFO_EFFECTIVE_URL), "\n";
 curl_reset($ch);

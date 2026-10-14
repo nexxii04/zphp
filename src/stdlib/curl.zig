@@ -78,7 +78,7 @@ fn freeSlist(obj: *PhpObject) void {
     }
 }
 
-fn cloneHandle(vm: *VM, src: *PhpObject, copy: *PhpObject) bool {
+fn cloneHandle(_: *VM, src: *PhpObject, copy: *PhpObject) bool {
     const handle = getHandle(src) orelse return false;
     const dup = c.curl_easy_duphandle(handle) orelse return false;
     copy.native = .{ .kind = .curl, .ptr = @intFromPtr(dup) };
@@ -98,8 +98,6 @@ fn cloneHandle(vm: *VM, src: *PhpObject, copy: *PhpObject) bool {
         copy.native.aux = @intFromPtr(fresh);
         _ = c.curl_easy_setopt(dup, c.CURLOPT_HTTPHEADER, fresh);
     }
-    // a duplicated handle starts with no transfer info
-    copy.set(vm.allocator, "__performed", .{ .bool = false }) catch return false;
     return true;
 }
 
@@ -138,7 +136,6 @@ fn curlInit(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult 
     if (args.len > 0 and args[0] == .string) {
         const url_z = try dupeZ(ctx, args[0].string.bytes());
         _ = c.curl_easy_setopt(handle, c.CURLOPT_URL, url_z.ptr);
-        try obj.set(ctx.allocator, "__url", args[0]);
     }
 
     return NativeResult.borrowed(.{ .object = obj });
@@ -198,7 +195,6 @@ fn applySetopt(ctx: *NativeContext, handle: *c.CURL, obj: *PhpObject, option: i6
         };
         const z = try dupeZ(ctx, s);
         const code: c_uint = @intCast(c.curl_easy_setopt(handle, @intCast(option), z.ptr));
-        if (code == c.CURLE_OK and option == c.CURLOPT_URL) try obj.setCopiedString(ctx.allocator, "__url", s);
         return NativeResult.scalar(.{ .bool = code == c.CURLE_OK });
     }
 
@@ -398,7 +394,6 @@ fn curlExec(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult 
     }
 
     const result = c.curl_easy_perform(handle);
-    try obj.set(ctx.allocator, "__performed", .{ .bool = true });
 
     // store error info
     if (result != c.CURLE_OK) {
@@ -462,28 +457,15 @@ fn curlGetinfo(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResu
 
     // no specific option - return all info as array
     if (args.len < 2 or args[1] == .null) {
-        return getAllInfo(ctx, obj, handle);
+        return getAllInfo(ctx, handle);
     }
 
     if (args[1] != .int) return NativeResult.scalar(.{ .bool = false });
     const option = args[1].int;
-    return getInfoOption(ctx, obj, handle, option);
+    return getInfoOption(ctx, handle, option);
 }
 
-// before any transfer, the effective url is the url as set. newer libcurl
-// (8.23) normalizes it ("http://example.com/"), which php builds on older
-// libcurl don't, so the output stays the same whichever libcurl is linked
-fn presetUrl(obj: *PhpObject) ?[]const u8 {
-    const performed = obj.get("__performed");
-    if (performed == .bool and performed.bool) return null;
-    const url = obj.get("__url");
-    return if (url == .string) url.string.bytes() else null;
-}
-
-fn getInfoOption(ctx: *NativeContext, obj: *PhpObject, handle: *c.CURL, option: i64) RuntimeError!NativeResult {
-    if (option == c.CURLINFO_EFFECTIVE_URL) {
-        if (presetUrl(obj)) |url| return NativeResult.takeString(try Value.String.create(ctx.allocator, url));
-    }
+fn getInfoOption(ctx: *NativeContext, handle: *c.CURL, option: i64) RuntimeError!NativeResult {
     if (option == c.CURLINFO_COOKIELIST) {
         var list: ?*c.struct_curl_slist = null;
         if (c.curl_easy_getinfo(handle, c.CURLINFO_COOKIELIST, &list) != c.CURLE_OK) return NativeResult.scalar(.{ .bool = false });
@@ -551,13 +533,11 @@ fn getInfoOption(ctx: *NativeContext, obj: *PhpObject, handle: *c.CURL, option: 
     return NativeResult.scalar(.{ .bool = false });
 }
 
-fn getAllInfo(ctx: *NativeContext, obj: *PhpObject, handle: *c.CURL) RuntimeError!NativeResult {
+fn getAllInfo(ctx: *NativeContext, handle: *c.CURL) RuntimeError!NativeResult {
     const arr = try ctx.createArray();
 
     var url_ptr: [*c]u8 = null;
-    if (presetUrl(obj)) |url| {
-        try arr.setCopiedString(ctx.allocator, .{ .string = Value.String.borrowed("url") }, url);
-    } else if (c.curl_easy_getinfo(handle, c.CURLINFO_EFFECTIVE_URL, &url_ptr) == c.CURLE_OK) {
+    if (c.curl_easy_getinfo(handle, c.CURLINFO_EFFECTIVE_URL, &url_ptr) == c.CURLE_OK) {
         if (url_ptr != null) {
             try arr.setCopiedString(ctx.allocator, .{ .string = Value.String.borrowed("url") }, std.mem.span(url_ptr));
         }
@@ -749,8 +729,6 @@ fn curlReset(ctx: *NativeContext, args: []const Value) RuntimeError!NativeResult
     try obj.set(ctx.allocator, "__error", .{ .string = Value.String.borrowed("") });
     try obj.set(ctx.allocator, "__errno", .{ .int = 0 });
     try obj.set(ctx.allocator, "__http_code", .{ .int = 0 });
-    try obj.set(ctx.allocator, "__url", .null);
-    try obj.set(ctx.allocator, "__performed", .{ .bool = false });
     freeSlist(obj);
     return NativeResult.scalar(.null);
 }
@@ -927,7 +905,6 @@ fn curlMultiAddHandle(ctx: *NativeContext, args: []const Value) RuntimeError!Nat
         _ = c.curl_easy_setopt(easy, c.CURLOPT_WRITEDATA, @as(*anyopaque, @ptrCast(wcb)));
     }
     const code = c.curl_multi_add_handle(mh, easy);
-    if (code == c.CURLM_OK) try args[1].object.set(ctx.allocator, "__performed", .{ .bool = true });
     if (code == c.CURLM_OK) try (try multiHandles(ctx, args[0].object)).append(ctx.allocator, args[1]);
     return NativeResult.scalar(.{ .int = @intCast(code) });
 }
