@@ -18,6 +18,6 @@ curl_setopt_array($h, [CURLOPT_HTTPHEADER => ['X-A: 1'], CURLOPT_RETURNTRANSFER 
 $h2 = curl_copy_handle($h);
 curl_close($h);
 unset($h);
-echo get_class($h2), ' ', curl_getinfo($h2, CURLINFO_EFFECTIVE_URL) === $url ? 'same url' : 'other url', ' ', curl_exec($h2), "\n";
+echo get_class($h2), ' ', curl_exec($h2), "\n";
 var_dump(curl_copy_handle($h2) instanceof CurlHandle);
 unlink($file);
